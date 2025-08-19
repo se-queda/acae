@@ -1,0 +1,8 @@
+latent_dim: 256
+batch_size: 128
+lr: 0.0001
+mask_rates: [0.05, 0.15, 0.3, 0.5]
+lambda_d: 1.0
+lambda_e: 1.0
+recon_weight: 1.0
+epochs: 50
