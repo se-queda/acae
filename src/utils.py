@@ -8,9 +8,6 @@ def load_txt_file(path):
 
 
 def load_smd_windows(data_root, machine_id, window=64, stride=2):
-    """
-    Load and window the SMD dataset for a specific machine.
-    """
     # Load raw data
     train_data = load_txt_file(f"{data_root}/train/{machine_id}.txt")
     test_data = load_txt_file(f"{data_root}/test/{machine_id}.txt")
@@ -39,9 +36,6 @@ def load_smd_windows(data_root, machine_id, window=64, stride=2):
 
 
 def build_tf_datasets(train_w, test_w, val_split=0.2, batch_size=128):
-    """
-    Convert numpy windows into tf.data.Datasets.
-    """
     num_train = int(len(train_w) * (1 - val_split))
     train_data, val_data = train_w[:num_train], train_w[num_train:]
 
