@@ -1,9 +1,11 @@
 import yaml
 import argparse
+import numpy as np
+from sklearn.metrics import roc_auc_score
 from tensorflow.keras import backend as K
 
-from src.models import build_encoder, build_decoder, build_discriminator
 from src.trainer import ACAETrainer
+from src.models import build_encoder, build_decoder, build_discriminator
 from src.utils import load_smd_windows, build_tf_datasets
 
 
@@ -13,11 +15,10 @@ def load_config(path):
 
 
 def main(config_path):
-    # 🧠 Load config
     config = load_config(config_path)
 
-    # 📦 Load data
-    train_w, test_w, y_test_win, mean, std = load_smd_windows(
+    # 📦 Load dataset
+    train_w, test_w, y_test_win, _, _ = load_smd_windows(
         data_root="data/smd",
         machine_id="machine-1-1",
         window=64,
@@ -39,15 +40,20 @@ def main(config_path):
     trainer = ACAETrainer(encoder, decoder, discriminator, config)
     trainer.fit(train_ds, val_ds=val_ds, epochs=config['epochs'])
 
-    X_orig, X_rec = trainer.reconstruct(test_ds)
+    # 📊 Inference for AUC-ROC
+    print("\n🔍 Running post-training inference for AUC-ROC...")
+    scores, y_true = trainer.get_reconstruction_errors(test_ds, y_test_win)
+    auc = roc_auc_score(y_true, scores)
+    print(f"✅ AUC-ROC: {auc:.4f}")
 
-    # 🧹 Clear TF session (optional cleanup)
+    # 🧹 Optional cleanup
     K.clear_session()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train ACAE on SMD")
+    parser = argparse.ArgumentParser(description="Train and evaluate ACAE on SMD")
     parser.add_argument('--config', type=str, default="config.yaml", help='Path to config file')
     args = parser.parse_args()
 
     main(args.config)
+
