@@ -21,6 +21,7 @@ This is an **unofficial, fully modular implementation** of the paper:
 ## 📦 Folder Structure
 ```
 acae/
+├── checkpoints
 ├── src/
 │ ├── models.py
 │ ├── losses.py
