@@ -21,20 +21,19 @@ This is an **unofficial, fully modular implementation** of the paper:
 ## 📦 Folder Structure
 ```
 acae/
-├── checkpoints
 ├── src/
-│ ├── models.py
-│ ├── losses.py
-│ ├── masking.py
-│ ├── utils.py
-│ └── trainer.py
+│ ├── models.py //includes the residual block, encoder, decoder, discriminator
+│ ├── losses.py //contains discrimanor and encoder loss
+│ ├── masking.py //conatins feature mixing and masked view generation
+│ ├── utils.py //data loaded and preprocessor
+│ └── trainer.py //Contains the ACAE trainer optimised with xla
 ├── data/
 │ └── smd/ # Place your downloaded SMD dataset here
 ├── checkpoints/
-│ └── *.h5 # Saved model weights per machine
+│ └── *.h5 # conatins saved weights across all 28 machines
 ├── config.yaml
 ├── requirements.txt
-├── train.py
+├── train.py //ENTRY POINT
 ├── .gitignore
 └── README.md
 ```
