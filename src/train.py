@@ -1,4 +1,4 @@
-import yaml
+mport yaml
 import argparse
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -51,7 +51,7 @@ def main(config_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train and evaluate ACAE on SMD")
+    parser = argparse.ArgumentParser(description="Train and evaluate ACAE on smd")
     parser.add_argument('--config', type=str, default="config.yaml", help='Path to config file')
     args = parser.parse_args()
 

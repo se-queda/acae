@@ -2,7 +2,7 @@ import tensorflow as tf
 from tqdm import tqdm
 from .losses import encoder_loss, discriminator_loss
 from .masking import generate_masked_views, mix_features
-
+import numpy as np
 
 class ACAETrainer:
     def __init__(self, encoder, decoder, discriminator, config):
