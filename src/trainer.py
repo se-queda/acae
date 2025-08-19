@@ -130,3 +130,13 @@ class ACAETrainer:
             tf.concat(originals, axis=0).numpy(),
             tf.concat(reconstructions, axis=0).numpy()
         )
+    def get_reconstruction_errors(self, dataset, y_true):
+        scores = []
+
+        for batch in dataset:
+            z = self.encoder(batch, training=False)
+            x_hat = self.decoder(z, training=False)
+            mse = tf.reduce_mean(tf.square(batch - x_hat), axis=[1, 2])
+            scores.extend(mse.numpy())
+
+        return np.array(scores), np.array(y_true)
