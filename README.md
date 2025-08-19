@@ -10,11 +10,11 @@ This is an **unofficial, fully modular implementation** of the paper:
 
 ## 🚀 Features
 
-- ✅ TensorFlow 2.x implementation with `@tf.function` and XLA acceleration  
-- ✅ Modular architecture: encoder, decoder, discriminator, masking  
-- ✅ End-to-end training on the full [SMD Dataset](https://github.com/NetManAIOps/OmniAnomaly/tree/master/OmniAnomaly/datasets/SMD)
-- ✅ Supports batch training across all 28 machines
-- ✅ AUC-ROC evaluation + model checkpointing
+- TensorFlow 2.x implementation with `@tf.function` and XLA acceleration  
+- encoder, decoder, discriminator, masking  
+- End-to-end training on the full [SMD Dataset](https://github.com/NetManAIOps/OmniAnomaly/tree/master/OmniAnomaly/datasets/SMD)
+- Batch training across all 28 machines
+- AUC-ROC evaluation + model checkpointing
 
 ---
 
