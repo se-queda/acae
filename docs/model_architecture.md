@@ -7,7 +7,7 @@ flowchart TD
     end
 
     subgraph Split["Data Split"]
-        S1[Original Sample] --> M1
+        S1[Original Sample] --> Masking
         S1 --> Anchor
         S1 --> NegGen[Negative Sample<br/>Generation]
     end
