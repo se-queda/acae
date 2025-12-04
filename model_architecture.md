@@ -1,14 +1,17 @@
+```mermaid
 flowchart TD
  subgraph subGraph0
     Input
     Projection["Projection Layer<br>(128 x 64 x 256)"]
  end
+
  subgraph subGraph1["ACAE Model"]
     direction LR
         Encoder(("Encoder"))
         Decoder(("Decoder"))
         Discriminator(("Discriminator"))
  end
+
  subgraph subGraph2
         GMV(("generate_masked_views"))
         PosLatents(("Positive Latents"))
@@ -16,11 +19,13 @@ flowchart TD
         LatentZ(("Z (Anchor)"))
         PosSamples(("Positive Composites"))
  end
+
  subgraph subGraph3
         Shuffle["tf.random.shuffle(z)"]
         MF2(("mix_features"))
         NegSamples(("Negative Composites"))
  end
+
  subgraph subGraph4["Loss Calculation"]
     direction LR
         DiscOut
@@ -30,11 +35,13 @@ flowchart TD
         Reconstructed
         TL(("Total Loss"))
  end
+
  subgraph subGraph5
         subGraph2
         subGraph3
         subGraph4
  end
+
     Input --> Projection
     Projection --> Encoder & GMV
     Encoder -- Latent Vector z (128 x 256) --> LatentZ
@@ -73,10 +80,4 @@ flowchart TD
     style ReconLoss fill:#d4e8d4,stroke:#333,stroke-width:2px
     style Reconstructed fill:#d4e8d4,stroke:#333,stroke-width:2px
     style TL fill:#cce6ff,stroke:#333,stroke-width:2px
-    style LatentZ fill:#ffe6cc,stroke:#333,stroke-width:2px
-    style PosSamples fill:#e1f3fe,stroke:#333,stroke-width:2px
-    style NegSamples fill:#f8cecc,stroke:#333,stroke-width:2px
-    style DiscOut fill:#f9f9f9,stroke:#333,stroke-width:2px
-    style ReconLoss fill:#d4e8d4,stroke:#333,stroke-width:2px
-    style Reconstructed fill:#d4e8d4,stroke:#333,stroke-width:2px
-    style TL fill:#cce6ff,stroke:#333,stroke-width:2px
+```
