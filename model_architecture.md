@@ -1,32 +1,40 @@
 ```mermaid
 flowchart TD
- %% --- Data Preprocessing ---
- subgraph subGraph0
-    Input
-    Projection["Projection Layer<br>(Maps 38 -> 256)"]
+ %% --- Phase 1: Data Preprocessing (Before Model) ---
+ subgraph subGraphPrep["Phase 1: Preprocessing Pipeline"]
+    RawData["Raw Data (SMD)<br>(N, 38)"]
+    Norm["Normalization"]
+    Window["Sliding Window<br>Size: 64"]
+    Batch["Batching<br>(128, 64, 38)"]
  end
 
- %% --- Augmentation Module (Explicit Split) ---
- subgraph subGraphMask
+ %% --- Phase 2: Input Projection ---
+ subgraph subGraphProj["Phase 2: Projection"]
+    Projection["Projection Layer<br>38 -> 256<br>Out: (128, 64, 256)"]
+ end
+
+ %% --- Phase 3: Augmentation ---
+ subgraph subGraphMask["Phase 3: Multi-Scale Masking"]
     direction TB
+    noteMask["Input: Clean A_i<br>(128, 64, 256)"]
     M1("Mask 5%")
     M2("Mask 15%")
     M3("Mask 30%")
     M4("Mask 50%")
  end
 
- %% --- Core Model ---
- subgraph subGraphModel["ACAE Architecture"]
-    Encoder(("Encoder<br>(ResNet-1D)"))
-    Decoder(("Decoder<br>(ResNet-1D)"))
+ %% --- Phase 4: Core Model ---
+ subgraph subGraphModel["Phase 4: ACAE Core"]
+    Encoder(("Encoder<br>(ResNet-1D)<br>Out: (128, 64, 256)"))
+    Decoder(("Decoder<br>(ResNet-1D)<br>Out: (128, 64, 38)"))
     Discriminator(("Discriminator<br>(MLP)"))
  end
 
- %% --- Latent Space Expansion ---
- subgraph subGraphLatents
-    LatentZ(("Anchor Z"))
+ %% --- Latent Space ---
+ subgraph subGraphLatents["Latent Space"]
+    LatentZ(("Anchor Z<br>(128, 64, 256)"))
     
-    subgraph PosLatentGroup["4 Positive Latents"]
+    subgraph PosLatentGroup["Augmented Latents (128, 64, 256)"]
       Z1("Z_pos (5%)")
       Z2("Z_pos (15%)")
       Z3("Z_pos (30%)")
@@ -34,47 +42,50 @@ flowchart TD
     end
  end
 
- %% --- Positive Pair Generation ---
+ %% --- Pair Generation ---
  subgraph subGraphPos["Positive Pair Generation"]
-        MixPos(("Linear Combination<br>Eq: αZ + (1-α)Z_pos"))
-        PosSamples(("Positive<br>Composites"))
+    MixPos(("Linear Mix<br>αZ + (1-α)Z_pos"))
+    PosSamples(("Positive<br>Composites<br>(128, 64, 256)"))
  end
 
- %% --- Negative Pair Generation ---
  subgraph subGraphNeg["Negative Pair Generation"]
-        Shuffle
-        NegLatents(("Negative Latents<br>(Z_neg)"))
-        MixNeg(("Linear Combination"))
-        NegSamples(("Negative<br>Composites"))
+    Shuffle["Shuffle Batch"]
+    NegLatents(("Negative Latents<br>(Z_neg)<br>(128, 64, 256)"))
+    MixNeg(("Linear Mix<br>βZ + (1-β)Z_neg"))
+    NegSamples(("Negative<br>Composites<br>(128, 64, 256)"))
  end
 
- %% --- Loss Calculation ---
+ %% --- Loss ---
  subgraph subGraphLoss["Loss Optimization"]
-        DiscOut
-        DL(("L_disc"))
-        EL(("L_encoder"))
-        ReconLoss(("L_recon"))
-        TL(("Total Loss"))
+    DiscOut["Logits"]
+    DL(("L_disc"))
+    EL(("L_encoder"))
+    ReconLoss(("L_recon"))
+    TL(("Total Loss"))
  end
 
-    %% 1. Input Flow
-    Input --> Projection
+    %% Flow Connections
+    %% 1. Preprocessing
+    RawData --> Norm --> Window --> Batch
     
-    %% 2. Split: Clean vs Masked Paths
-    Projection -- "Clean View (A)" --> Encoder
-    Projection -- "Clean View (A)" --> M1 & M2 & M3 & M4
+    %% 2. Projection
+    Batch --> Projection
     
-    %% 3. Masked Views into Encoder
+    %% 3. Split: Clean vs Masked
+    Projection -- "Clean High-Dim View (A_i)" --> Encoder
+    Projection -- "Clean High-Dim View (A_i)" --> M1 & M2 & M3 & M4
+    
+    %% 4. Masking
     M1 --> Encoder
     M2 --> Encoder
     M3 --> Encoder
     M4 --> Encoder
 
-    %% 4. Encoder Outputs (1 Anchor + 4 Positives)
+    %% 5. Encoder Outputs
     Encoder --> LatentZ
     Encoder --> Z1 & Z2 & Z3 & Z4
 
-    %% 5. Positive Mixing (All 5 vectors converge)
+    %% 6. Positive Mixing
     LatentZ --> MixPos
     Z1 --> MixPos
     Z2 --> MixPos
@@ -82,47 +93,43 @@ flowchart TD
     Z4 --> MixPos
     MixPos --> PosSamples
 
-    %% 6. Negative Mixing
+    %% 7. Negative Mixing
     LatentZ --> Shuffle
-    LatentZ --> MixNeg
     Shuffle --> NegLatents
+    LatentZ --> MixNeg
     NegLatents --> MixNeg
     MixNeg --> NegSamples
 
-    %% 7. Discriminator (Needs Anchor + Composites)
+    %% 8. Discriminator
     LatentZ --> Discriminator
     PosSamples --> Discriminator
     NegSamples --> Discriminator
     Discriminator --> DiscOut
 
-    %% 8. Reconstruction
+    %% 9. Reconstruction
     LatentZ --> Decoder
     Decoder --> ReconLoss
-    Input -. "Ground Truth".-> ReconLoss
+    Batch -. "Ground Truth X_i<br>(128, 64, 38)".-> ReconLoss
 
-    %% 9. Loss Aggregation
+    %% 10. Loss Aggregation
     DiscOut --> DL & EL
     ReconLoss --> TL
     DL --> TL
     EL --> TL
 
     %% Styling
-    style Input fill:#f9f9f9,stroke:#333,stroke-width:2px
+    style RawData fill:#f9f9f9,stroke:#333
+    style Norm fill:#f5f5f5,stroke:#333
+    style Window fill:#f5f5f5,stroke:#333
+    style Batch fill:#fff2cc,stroke:#333,stroke-width:2px
     style Projection fill:#d0e0e3,stroke:#333,stroke-width:2px
     style M1 fill:#e1d5e7,stroke:#333
     style M2 fill:#e1d5e7,stroke:#333
     style M3 fill:#e1d5e7,stroke:#333
     style M4 fill:#e1d5e7,stroke:#333
     style Encoder fill:#fff2cc,stroke:#333,stroke-width:2px
-    style Decoder fill:#fff2cc,stroke:#333,stroke-width:2px
-    style Discriminator fill:#f8cecc,stroke:#333,stroke-width:2px
     style LatentZ fill:#ffe6cc,stroke:#333,stroke-width:4px
-    style Z1 fill:#e1f3fe,stroke:#333
-    style Z2 fill:#e1f3fe,stroke:#333
-    style Z3 fill:#e1f3fe,stroke:#333
-    style Z4 fill:#e1f3fe,stroke:#333
-    style MixPos fill:#dae8fc,stroke:#333,stroke-width:2px
-    style MixNeg fill:#f8cecc,stroke:#333,stroke-width:2px
 ```
+
 
 
