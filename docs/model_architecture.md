@@ -1,53 +1,58 @@
-# ACAE Model Architecture
-
-```mermaid
 flowchart TD
- subgraph subGraph0["Data Pipeline"]
-        Input["Time Series Batch (128 x 64 x 38)"]
-  end
+ subgraph subGraph0
+        Input
+        Projection["Projection Layer<br>(128 x 64 x 256)"]
+ end
  subgraph subGraph1["ACAE Model"]
     direction LR
         Encoder(("Encoder"))
         Decoder(("Decoder"))
         Discriminator(("Discriminator"))
-  end
- subgraph subGraph2["Positive Samples"]
+ end
+ subgraph subGraph2
         GMV(("generate_masked_views"))
         PosLatents(("Positive Latents"))
         MF1(("mix_features"))
-        LatentZ(("Z"))
-        PosSamples(("Positive Samples"))
-  end
- subgraph subGraph3["Negative Samples"]
+        LatentZ(("Z (Anchor)"))
+        PosSamples(("Positive Composites"))
+ end
+ subgraph subGraph3
         Shuffle["tf.random.shuffle(z)"]
         MF2(("mix_features"))
-        NegSamples(("Negative Samples"))
-  end
+        NegSamples(("Negative Composites"))
+ end
  subgraph subGraph4["Loss Calculation"]
     direction LR
-        DiscOut["Discriminator Output<br>(label, proportion)"]
+        DiscOut
         DL(("discriminator_loss"))
         EL(("encoder_loss"))
         ReconLoss(("Reconstruction Loss"))
-        Reconstructed["Reconstructed Batch<br>(128 x 64 x 38)"]
+        Reconstructed
         TL(("Total Loss"))
-  end
- subgraph subGraph5["Training Step"]
+ end
+ subgraph subGraph5
         subGraph2
         subGraph3
         subGraph4
-  end
-    Input --> Encoder & GMV
-    Encoder -- Latent Vector z (128 x 256) --> LatentZ
+ end
+    Input --> Projection
+    Projection --> Encoder & GMV
+    Encoder -- Latent Vector z --> LatentZ
     GMV -- Masked Views --> Encoder
     Encoder -- Positive Latents --> PosLatents
     LatentZ --> MF1 & Shuffle & MF2 & EL & Decoder
+    
+    %% Critical Update: Discriminator needs the Anchor Z to compare against composites
+    LatentZ --> Discriminator
+    
     PosLatents --> MF1
     MF1 --> PosSamples
-    Shuffle --> MF2
+    Shuffle -- Negative Latents --> MF2
     MF2 --> NegSamples
-    PosSamples --> Discriminator & Discriminator
-    NegSamples --> Discriminator & Discriminator
+    
+    PosSamples --> Discriminator
+    NegSamples --> Discriminator
+    
     Discriminator --> DiscOut
     DiscOut --> DL & EL
     Decoder --> Reconstructed
@@ -57,6 +62,7 @@ flowchart TD
     EL --> TL
 
     style Input fill:#f9f9f9,stroke:#333,stroke-width:2px
+    style Projection fill:#d0e0e3,stroke:#333,stroke-width:2px
     style Encoder fill:#fff2cc,stroke:#333,stroke-width:2px
     style Decoder fill:#fff2cc,stroke:#333,stroke-width:2px
     style Discriminator fill:#fff2cc,stroke:#333,stroke-width:2px
@@ -67,8 +73,4 @@ flowchart TD
     style ReconLoss fill:#d4e8d4,stroke:#333,stroke-width:2px
     style Reconstructed fill:#d4e8d4,stroke:#333,stroke-width:2px
     style TL fill:#cce6ff,stroke:#333,stroke-width:2px
-
-
-
-```
 
