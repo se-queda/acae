@@ -5,12 +5,12 @@ from .masking import generate_masked_views, mix_features
 import numpy as np
 
 class ACAETrainer:
-    def __init__(self, encoder, decoder, discriminator, config):
+    def __init__(self, projection_head, encoder, decoder, discriminator, config):
+        self.projection_head = projection_head  # NEW
         self.encoder = encoder
         self.decoder = decoder
         self.discriminator = discriminator
 
-        # Hyperparameters from config
         self.latent_dim = config.get('latent_dim', 256)
         self.lambda_d = config.get('lambda_d', 1.0)
         self.lambda_e = config.get('lambda_e', 1.0)
@@ -19,25 +19,30 @@ class ACAETrainer:
         self.lr = config.get('lr', 1e-4)
         self.mask_rates = config.get('mask_rates', [0.05, 0.15, 0.3, 0.5])
 
-        # Optimizers
         self.enc_dec_optimizer = tf.keras.optimizers.Adam(self.lr)
         self.disc_optimizer = tf.keras.optimizers.Adam(self.lr)
-
-        # Logs
         self.loss_log = {'recon': [], 'disc': [], 'enc': []}
 
     @tf.function(jit_compile=True)
     def _train_step(self, batch):
         with tf.GradientTape(persistent=True) as tape:
-            # Encode & Reconstruct
-            z = self.encoder(batch, training=True)
+            # 1. PROJECTION (The missing link)
+            # Projects (128, 64, 38) -> (128, 64, 256)
+            projected_batch = self.projection_head(batch, training=True)
+
+            # 2. ENCODE & RECONSTRUCT
+            # Encoder takes PROJECTED data
+            z = self.encoder(projected_batch, training=True)
+            # Decoder reconstructs RAW data
             x_hat = self.decoder(z, training=True)
             recon_loss = tf.reduce_mean(tf.square(batch - x_hat))
 
-            # Masked views → positive samples
-            masked_views = generate_masked_views(batch, self.mask_rates)
+            # 3. MASKING (On Projected Data)
+            # Masking zeros out entire 256-dim vectors at specific steps
+            masked_views = generate_masked_views(projected_batch, self.mask_rates)
             pos_latents = [self.encoder(view, training=True) for view in masked_views]
 
+            # 4. POSITIVE PAIR GENERATION
             z_pos_all, alpha_all = [], []
             for z_pos in pos_latents:
                 z_mixed, alpha = mix_features(z, z_pos)
@@ -47,14 +52,23 @@ class ACAETrainer:
             z_mixed_pos = tf.concat(z_pos_all, axis=0)
             alpha_pos = tf.concat(alpha_all, axis=0)
 
-            # Negative sample
+            # 5. NEGATIVE PAIR GENERATION
             z_neg, beta_neg = mix_features(z, tf.random.shuffle(z))
 
-            # Discriminator outputs
-            d_out_pos = self.discriminator(z_mixed_pos, training=True)
-            d_out_neg = self.discriminator(z_neg, training=True)
+            # 6. DISCRIMINATOR (Pair Input)
+            # Must feed (Reference, Composite) pair
+            # Repeat z to match the size of z_mixed_pos (which has 4x batch size due to 4 masks)
+            z_repeated = tf.tile(z, [len(self.mask_rates), 1])
+            
+            # Input shape: (Batch*4, 512)
+            d_in_pos = tf.concat([z_repeated, z_mixed_pos], axis=1)
+            # Input shape: (Batch, 512)
+            d_in_neg = tf.concat([z, z_neg], axis=1)
 
-            # Losses
+            d_out_pos = self.discriminator(d_in_pos, training=True)
+            d_out_neg = self.discriminator(d_in_neg, training=True)
+
+            # 7. LOSSES
             loss_disc = discriminator_loss(d_out_pos, d_out_neg, alpha_pos, beta_neg)
             loss_enc = encoder_loss(d_out_pos, d_out_neg, beta_neg)
 
@@ -65,7 +79,10 @@ class ACAETrainer:
             )
 
         # Backprop
-        enc_dec_vars = self.encoder.trainable_variables + self.decoder.trainable_variables
+        # Train Projection + Encoder + Decoder together
+        enc_dec_vars = (self.projection_head.trainable_variables + 
+                        self.encoder.trainable_variables + 
+                        self.decoder.trainable_variables)
         disc_vars = self.discriminator.trainable_variables
 
         self.enc_dec_optimizer.apply_gradients(zip(
@@ -117,12 +134,14 @@ class ACAETrainer:
                 if wait >= patience:
                     print(f"🛑 Early stopping at epoch {epoch+1} — no recon improvement.")
                     break
-
+    
     def reconstruct(self, dataset):
         reconstructions = []
         originals = []
         for batch in dataset:
-            z = self.encoder(batch)
+            # Need to project first!
+            proj = self.projection_head(batch)
+            z = self.encoder(proj)
             x_hat = self.decoder(z)
             reconstructions.append(x_hat.numpy())
             originals.append(batch.numpy())
@@ -130,13 +149,13 @@ class ACAETrainer:
             tf.concat(originals, axis=0).numpy(),
             tf.concat(reconstructions, axis=0).numpy()
         )
+
     def get_reconstruction_errors(self, dataset, y_true):
         scores = []
-
         for batch in dataset:
-            z = self.encoder(batch, training=False)
+            proj = self.projection_head(batch, training=False)
+            z = self.encoder(proj, training=False)
             x_hat = self.decoder(z, training=False)
             mse = tf.reduce_mean(tf.square(batch - x_hat), axis=[1, 2])
             scores.extend(mse.numpy())
-
         return np.array(scores), np.array(y_true)

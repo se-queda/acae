@@ -7,7 +7,8 @@ from sklearn.metrics import roc_auc_score
 from tensorflow.keras import backend as K
 
 from src.trainer import ACAETrainer
-from src.models import build_encoder, build_decoder, build_discriminator
+# Import new projection builder
+from src.models import build_encoder, build_decoder, build_discriminator, build_projection_head 
 from src.utils import load_smd_windows, build_tf_datasets
 
 
@@ -31,11 +32,29 @@ def train_on_machine(machine_id, config):
         batch_size=config['batch_size']
     )
 
-    encoder = build_encoder(input_shape=(64, train_w.shape[-1]), latent_dim=config['latent_dim'])
-    decoder = build_decoder(latent_dim=config['latent_dim'], output_shape=(64, train_w.shape[-1]))
+    # 1. Build Projection Head (Raw 38 -> Latent 256)
+    projection = build_projection_head(
+        input_shape=(64, train_w.shape[-1]), 
+        projection_dim=config['latent_dim']
+    )
+
+    # 2. Build Encoder (Input is now 256, not 38)
+    encoder = build_encoder(
+        input_shape=(64, config['latent_dim']), 
+        latent_dim=config['latent_dim']
+    )
+
+    # 3. Build Decoder (Latent -> Raw 38)
+    decoder = build_decoder(
+        latent_dim=config['latent_dim'], 
+        output_shape=(64, train_w.shape[-1])
+    )
+
+    # 4. Build Discriminator (Concatenated Input logic handled inside, output is same)
     discriminator = build_discriminator(latent_dim=config['latent_dim'])
 
-    trainer = ACAETrainer(encoder, decoder, discriminator, config)
+    # Pass all 4 models to trainer
+    trainer = ACAETrainer(projection, encoder, decoder, discriminator, config)
     trainer.fit(train_ds, val_ds=val_ds, epochs=config['epochs'])
 
     scores, y_true = trainer.get_reconstruction_errors(test_ds, y_test_win)
@@ -46,6 +65,8 @@ def train_on_machine(machine_id, config):
     machine_dir = f"checkpoints/{machine_id}"
     os.makedirs(machine_dir, exist_ok=True)
 
+    # Save all weights
+    projection.save_weights(f"{machine_dir}/projection.weights.h5")
     encoder.save_weights(f"{machine_dir}/encoder.weights.h5")
     decoder.save_weights(f"{machine_dir}/decoder.weights.h5")
     discriminator.save_weights(f"{machine_dir}/discriminator.weights.h5")
@@ -62,7 +83,7 @@ def run_all_machines(config):
             [f"machine-3-{i}" for i in range(1, 11)]
     )
     skip_machines = set([
-        "machine-1-1", "machine-1-2", "machine-1-3", "machine-1-4", "machine-1-5","machine-1-6","machine-1-7",
+         "machine-1-1", "machine-1-2", "machine-1-3", "machine-1-4", "machine-1-5","machine-1-6","machine-1-7",
         "machine-2-1", "machine-2-2", "machine-2-3", "machine-2-4", "machine-2-5", "machine-2-6", "machine-2-7", "machine-2-8",
         "machine-2-9", "machine-2-10", "machine-2-11", "machine-2-12"
     ])
