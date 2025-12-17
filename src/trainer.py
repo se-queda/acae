@@ -5,7 +5,9 @@ from .masking import generate_masked_views, mix_features
 import numpy as np
 
 class ACAETrainer:
-    def __init__(self, encoder, decoder, discriminator, config):
+    def __init__(self, projection_head, encoder, decoder, discriminator, config):
+        # Added projection_head to inputs
+        self.projection_head = projection_head 
         self.encoder = encoder
         self.decoder = decoder
         self.discriminator = discriminator
@@ -29,13 +31,24 @@ class ACAETrainer:
     @tf.function(jit_compile=True)
     def _train_step(self, batch):
         with tf.GradientTape(persistent=True) as tape:
-            # Encode & Reconstruct
-            z = self.encoder(batch, training=True)
+            # 1. Project Input (New Step)
+            # Shapes: (B, 64, 38) -> (B, 32, 128)
+            projected_batch = self.projection_head(batch, training=True)
+
+            # 2. Encode & Reconstruct
+            # Encoder takes projected features
+            z = self.encoder(projected_batch, training=True) 
             x_hat = self.decoder(z, training=True)
+            
+            # Recon loss is typically against ORIGINAL raw input batch
             recon_loss = tf.reduce_mean(tf.square(batch - x_hat))
 
-            # Masked views → positive samples
-            masked_views = generate_masked_views(batch, self.mask_rates)
+            # 3. Masked views → positive samples
+            # Note: Paper says masks are applied to the PROJECTED space (Eq 1 & Section 3.4)
+            # "After the projection layer, the timestamp mask is applied..."
+            masked_views = generate_masked_views(projected_batch, self.mask_rates)
+            
+            # Encoder takes masked projected views
             pos_latents = [self.encoder(view, training=True) for view in masked_views]
 
             z_pos_all, alpha_all = [], []
@@ -47,14 +60,15 @@ class ACAETrainer:
             z_mixed_pos = tf.concat(z_pos_all, axis=0)
             alpha_pos = tf.concat(alpha_all, axis=0)
 
-            # Negative sample
+            # 4. Negative sample
+            # Mix z with shuffled version of itself (batch shuffle)
             z_neg, beta_neg = mix_features(z, tf.random.shuffle(z))
 
-            # Discriminator outputs
+            # 5. Discriminator outputs
             d_out_pos = self.discriminator(z_mixed_pos, training=True)
             d_out_neg = self.discriminator(z_neg, training=True)
 
-            # Losses
+            # 6. Losses
             loss_disc = discriminator_loss(d_out_pos, d_out_neg, alpha_pos, beta_neg)
             loss_enc = encoder_loss(d_out_pos, d_out_neg, beta_neg)
 
@@ -65,7 +79,10 @@ class ACAETrainer:
             )
 
         # Backprop
-        enc_dec_vars = self.encoder.trainable_variables + self.decoder.trainable_variables
+        # Include projection_head variables in encoder optimization
+        enc_dec_vars = (self.projection_head.trainable_variables + 
+                        self.encoder.trainable_variables + 
+                        self.decoder.trainable_variables)
         disc_vars = self.discriminator.trainable_variables
 
         self.enc_dec_optimizer.apply_gradients(zip(
@@ -78,6 +95,7 @@ class ACAETrainer:
         return recon_loss, loss_disc, loss_enc
 
     def fit(self, train_ds, val_ds=None, epochs=50):
+        # ... (Fit loop logic is fine) ...
         best_val_loss = float('inf')
         patience = 5
         wait = 0
@@ -108,7 +126,8 @@ class ACAETrainer:
             self.loss_log['recon'].append(avg_recon)
             self.loss_log['disc'].append(avg_disc)
             self.loss_log['enc'].append(avg_enc)
-
+            
+            # Simple early stopping on training recon loss (since val_ds might be None)
             if avg_recon < best_val_loss:
                 best_val_loss = avg_recon
                 wait = 0
@@ -122,21 +141,25 @@ class ACAETrainer:
         reconstructions = []
         originals = []
         for batch in dataset:
-            z = self.encoder(batch)
-            x_hat = self.decoder(z)
+            # Add projection step here too
+            proj = self.projection_head(batch, training=False)
+            z = self.encoder(proj, training=False)
+            x_hat = self.decoder(z, training=False)
             reconstructions.append(x_hat.numpy())
             originals.append(batch.numpy())
         return (
             tf.concat(originals, axis=0).numpy(),
             tf.concat(reconstructions, axis=0).numpy()
         )
+
     def get_reconstruction_errors(self, dataset, y_true):
         scores = []
-
         for batch in dataset:
-            z = self.encoder(batch, training=False)
+            # Add projection step here too
+            proj = self.projection_head(batch, training=False)
+            z = self.encoder(proj, training=False)
             x_hat = self.decoder(z, training=False)
             mse = tf.reduce_mean(tf.square(batch - x_hat), axis=[1, 2])
             scores.extend(mse.numpy())
-
         return np.array(scores), np.array(y_true)
+
