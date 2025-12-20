@@ -3,6 +3,7 @@ from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 import os
 from scipy.signal import savgol_filter
+from .masking import get_masked_views
 
 def load_txt_file(path):
     if not os.path.exists(path):
@@ -70,9 +71,8 @@ def load_smd_windows(data_root, machine_id, window=64, train_stride=1):
     # We'll define masker.py later, but we call it here to get our 4 tiers.
     # It takes the jerk windows and outputs 4 binary masks.
     try:
-        from . import masker 
         # get_masked_views returns 4 arrays of shape (N, window, features)
-        v1, v2, v3, v4 = masker.get_masked_views(train_w_main, train_jerk_w)
+        v1, v2, v3, v4 = get_masked_views(train_w_main, train_jerk_w)
     except ImportError:
         print("⚠️ masker.py not found yet. Using dummy views for now.")
         v1, v2, v3, v4 = train_w_main, train_w_main, train_w_main, train_w_main

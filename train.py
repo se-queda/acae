@@ -1,67 +1,176 @@
-import os
 import yaml
 import argparse
-from src.utils import load_smd_windows, build_tf_datasets
-from src.models import build_projection_head, build_encoder, build_decoder, build_discriminator
+import os
+import csv
+import numpy as np
+import gc
+from sklearn.metrics import precision_recall_fscore_support
+from tensorflow.keras import backend as K
+import tensorflow as tf
+import multiprocessing as mp
+
 from src.trainer import ACAETrainer
-from src.evaluator import evaluate_model
-
-def main(args):
-# 1. Load Config
-with open(args.config, 'r') as f:
-config = yaml.safe_load(f)
-
-# 2. Load Packed Data
-# train_packed shape: (N, 5, window, features)
-train_packed, test_w, test_labels, mean, scale = load_smd_windows(
-data_root=config['data_root'],
-machine_id=args.machine,
-window=config['window_size'],
-train_stride=config['train_stride']
+from src.models import (
+    build_encoder,
+    build_decoder,
+    build_discriminator,
+    build_projection_head,
 )
+from src.utils import load_smd_windows, build_tf_datasets
+from src.metrics import compute_auc, compute_fc1, compute_pa_k_auc
 
-# 3. Build Datasets
-# train_ds/val_ds yield (B, 5, window, features)
-# test_ds yields (B, window, features)
-train_ds, val_ds, test_ds = build_tf_datasets(
-train_packed,
-test_w,
-val_split=config['val_split'],
-batch_size=config['batch_size']
-)
+def load_config(path):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
-# 4. Initialize Models
-# Note: input_shape for models is (window_size, num_features)
-input_shape = (config['window_size'], train_packed.shape[-1])
+def get_best_f1(scores, labels, step_size=200):
+    scores = np.asarray(scores, dtype=float)
+    labels = np.asarray(labels).astype(int)
+    min_score, max_score = np.min(scores), np.max(scores)
+    if min_score == max_score:
+        return 0.0, 0.0, 0.0, max_score
 
-proj_head = build_projection_head(input_shape)
-encoder = build_encoder(latent_dim=config['latent_dim'])
-decoder = build_decoder(input_shape, latent_dim=config['latent_dim'])
-discriminator = build_discriminator(latent_dim=config['latent_dim'])
+    thresholds = np.linspace(min_score, max_score, step_size)
+    best_f1, best_precision, best_recall, best_thresh = 0.0, 0.0, 0.0, thresholds[0]
 
-# 5. Initialize Trainer
-trainer = ACAETrainer(
-projection_head=proj_head,
-encoder=encoder,
-decoder=decoder,
-discriminator=discriminator,
-config=config
-)
+    for thresh in thresholds:
+        preds = (scores > thresh).astype(int)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, preds, average="binary", zero_division=0
+        )
+        if f1 > best_f1:
+            best_f1, best_precision, best_recall, best_thresh = f1, precision, recall, thresh
 
-# 6. Train using Physics-Augmented Views
-trainer.fit(train_ds, val_ds, epochs=config['epochs'])
+    return best_f1, best_precision, best_recall, best_thresh
 
-# 7. Evaluate on standard Test Windows
-# get_reconstruction_errors expects the standard test_ds (unpacked)
-scores, y_true = trainer.get_reconstruction_errors(test_ds, test_labels)
+def train_on_machine(machine_id, config):
+    print(f"\n🚀 Starting Training: {machine_id}")
 
-metrics = evaluate_model(scores, y_true)
-print(f"\n📊 Final Results for {args.machine}:")
-print(metrics)
+    # 1. Load Data
+    train_w, test_w, test_labels_pointwise, _, _ = load_smd_windows(
+        data_root=config.get("data_root", "/home/utsab/Downloads/smd/ServerMachineDataset"),
+        machine_id=machine_id,
+        window=64,
+        train_stride=2,
+    )
+
+    train_ds, val_ds, test_ds = build_tf_datasets(
+        train_w, test_w, val_split=0.2, batch_size=config["batch_size"],
+    )
+
+    # 2. Build Models (Fresh instances per machine)
+    features = train_w.shape[-1]
+    projection_head = build_projection_head(input_shape=(64, features))
+    encoder = build_encoder(input_shape_projected=(32, 128), latent_dim=config["latent_dim"])
+    decoder = build_decoder(latent_dim=config["latent_dim"], output_steps=64, output_features=features)
+    discriminator = build_discriminator(latent_dim=config["latent_dim"])
+
+    # 3. Trainer
+    trainer = ACAETrainer(
+        projection_head=projection_head,
+        encoder=encoder,
+        decoder=decoder,
+        discriminator=discriminator,
+        config=config,
+    )
+    
+    trainer.fit(train_ds, val_ds=val_ds, epochs=config["epochs"])
+
+    # 4. Evaluation
+    _, reconstructions = trainer.reconstruct(test_ds)
+    recons_flat = reconstructions.reshape(-1, features)
+    originals_flat = test_w.reshape(-1, features)
+    point_scores = np.sum(np.square(originals_flat - recons_flat), axis=1)
+
+    min_len = min(len(point_scores), len(test_labels_pointwise))
+    point_scores, test_labels_pointwise = point_scores[:min_len], test_labels_pointwise[:min_len]
+
+    auc = compute_auc(point_scores, test_labels_pointwise)
+    best_f1, prec_pt, rec_pt, thr = get_best_f1(point_scores, test_labels_pointwise)
+    preds = (point_scores > thr).astype(int)
+    fc1 = compute_fc1(preds, test_labels_pointwise)
+    pa_auc, _, _ = compute_pa_k_auc(point_scores, test_labels_pointwise, base_threshold=thr)
+
+    print(f"✅ {machine_id} -> AUC: {auc:.4f} | Fc1: {fc1:.4f} | PA%K: {pa_auc:.4f}")
+
+    # --- 5. AGGRESSIVE MEMORY CLEANUP ---
+    # Delete large objects first
+    del train_w, test_w, train_ds, val_ds, test_ds
+    del trainer, projection_head, encoder, decoder, discriminator
+    
+    # Clear Keras/TF backend session to release VRAM
+    K.clear_session()
+    
+    # Force Python Garbage Collector
+    gc.collect()
+    
+    # Note: TF can sometimes hold onto VRAM until the process ends. 
+    # For a truly bulletproof run, one would run each machine in a subprocess, 
+    # but this cleanup usually solves 99% of OOM issues on a 4060.
+
+    return auc, fc1, pa_auc
+
+def run_all_machines(config):
+    machine_ids = [f"machine-1-{i}" for i in range(5, 9)] + \
+                  [f"machine-2-{i}" for i in range(1, 10)] + \
+                  [f"machine-3-{i}" for i in range(1, 12)]
+    
+    os.makedirs("results", exist_ok=True)
+    csv_path = "results/acae_jerk_smd_results.csv"
+
+    if not os.path.isfile(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["machine_id", "auc", "fc1", "pa_k_auc"])
+
+    for mid in machine_ids:
+        # We spawn a fresh process for EVERY machine
+        # This is the only 100% way to stop RAM stacking in Python/TF
+        p = mp.Process(target=worker_task, args=(mid, config, csv_path))
+        p.start()
+        p.join() # Wait for the machine to finish before starting the next one
+
+def worker_task(mid, config, csv_path):
+    """
+    This runs in a completely isolated memory space.
+    When this function finishes, the process dies and RAM is freed.
+    """
+    try:
+        # We need to limit TF memory growth inside the worker
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+
+        auc, fc1, pa_auc = train_on_machine(mid, config)
+        
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([mid, auc, fc1, pa_auc])
+            
+    except Exception as e:
+        print(f"❌ Failed on {mid}: {e}")
+
+def main(config_path, run_all=False):
+    config = load_config(config_path)
+    if run_all:
+        run_all_machines(config)
+    else:
+        # Default single run logic
+        mid = "machine-1-1"
+        auc, fc1, pa_auc = train_on_machine(mid, config)
+        
+        os.makedirs("results", exist_ok=True)
+        csv_path = "results/acae_jerk_smd_results.csv"
+        file_exists = os.path.isfile(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["machine_id", "auc", "fc1", "pa_k_auc"])
+            writer.writerow([mid, auc, fc1, pa_auc])
 
 if __name__ == "__main__":
-parser = argparse.ArgumentParser()
-parser.add_argument("--config", type=str, default="config.yaml")
-parser.add_argument("--machine", type=str, default="1-1")
-main(parser.parse_args())
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--all", action="store_true")
+    args = parser.parse_args()
+    main(args.config, run_all=args.all)
