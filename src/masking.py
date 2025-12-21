@@ -16,11 +16,6 @@ def mix_features(z_orig, z_other):
 # --- UNIVARIATE PHYSICS MASKING ---
 
 def univariate_masker(data_windows, jerk_windows):
-    """
-    Optimized Univariate Masker:
-    - Pre-calculates thresholds and budgets for all 4 tiers at once.
-    - Pre-scores and sorts windows by instability to avoid redundant sorting.
-    """
     N, T, F = data_windows.shape
     tiers = [95, 90, 85, 80]
     views = []
@@ -56,6 +51,7 @@ def univariate_masker(data_windows, jerk_windows):
             k = budgets[i, f]
             if k > 0:
                 # Mask the top K 'jerkiest' windows using pre-sorted indices
+                # No Veto check here: if it's high jerk, it gets masked.
                 top_k_idx = sorted_indices[f][-k:]
                 v_tier[top_k_idx, :, f] = 0.0
         views.append(v_tier)
@@ -63,39 +59,4 @@ def univariate_masker(data_windows, jerk_windows):
     return views[0], views[1], views[2], views[3]
 
 
-def jerk_masker(data_windows, jerk_windows):
-    """
-    Story of this function:
-    1. Get 4 tiers of masked data from the univariate masker.
-    2. Check every window: if >= 50% features were masked, it's a 'System Failure'.
-    3. In system failure windows, mask all features to force the model to 
-       reconstruct from surrounding temporal context.
-    """
-    # 1. Get Univariate Views
-    v1, v2, v3, v4 = univariate_masker(data_windows, jerk_windows)
-    
-    N, T, F = data_windows.shape
-    final_views = []
-    
-    for v_tier in [v1, v2, v3, v4]:
-        # 2. Identify windows where the univariate masker has applied a zero-mask
-        # Result shape: (N, F) where True = masked
-        is_masked = np.all(v_tier == 0.0, axis=1) 
-        
-        # 3. Consensus Logic: Calculate masked feature ratio per window
-        # shape: (N,)
-        masked_ratio = np.sum(is_masked, axis=1) / F
-        
-        # 4. Declare System-Wide Failure if ratio >= 50%
-        system_failure_idx = np.where(masked_ratio >= 0.5)[0]
-        
-        # 5. Mask the entire window for ALL 38 features
-        if len(system_failure_idx) > 0:
-            v_tier[system_failure_idx, :, :] = 0.0
-            
-        final_views.append(v_tier)
-        
-    return final_views[0], final_views[1], final_views[2], final_views[3]
-
-# Alias for compatibility with your utils.py call
-get_masked_views = jerk_masker
+get_masked_views = univariate_masker

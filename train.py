@@ -94,29 +94,26 @@ def train_on_machine(machine_id, config):
     print(f"✅ {machine_id} -> AUC: {auc:.4f} | Fc1: {fc1:.4f} | PA%K: {pa_auc:.4f}")
 
     # --- 5. AGGRESSIVE MEMORY CLEANUP ---
-    # Delete large objects first
     del train_w, test_w, train_ds, val_ds, test_ds
     del trainer, projection_head, encoder, decoder, discriminator
-    
-    # Clear Keras/TF backend session to release VRAM
     K.clear_session()
-    
-    # Force Python Garbage Collector
     gc.collect()
-    
-    # Note: TF can sometimes hold onto VRAM until the process ends. 
-    # For a truly bulletproof run, one would run each machine in a subprocess, 
-    # but this cleanup usually solves 99% of OOM issues on a 4060.
 
     return auc, fc1, pa_auc
 
 def run_all_machines(config):
-    machine_ids = [f"machine-1-{i}" for i in range(5, 9)] + \
-                  [f"machine-2-{i}" for i in range(1, 10)] + \
-                  [f"machine-3-{i}" for i in range(1, 12)]
+    # UPDATED: Only the 11 target machines for the No-Veto experiment
+    machine_ids = [
+        # Set 1
+        "machine-1-3", "machine-1-4", "machine-1-8", 
+        # Set 2
+        "machine-2-1", "machine-2-2", "machine-2-3", "machine-2-9",
+        # Set 3
+        "machine-3-2", "machine-3-3", "machine-3-7", "machine-3-11"
+    ]
     
     os.makedirs("results", exist_ok=True)
-    csv_path = "results/acae_jerk_smd_results.csv"
+    csv_path = "results/acae_jerk_smd_uni_11.csv"
 
     if not os.path.isfile(csv_path):
         with open(csv_path, "w", newline="") as f:
@@ -124,19 +121,13 @@ def run_all_machines(config):
             writer.writerow(["machine_id", "auc", "fc1", "pa_k_auc"])
 
     for mid in machine_ids:
-        # We spawn a fresh process for EVERY machine
-        # This is the only 100% way to stop RAM stacking in Python/TF
+        # Spawn fresh process per machine to isolate RAM
         p = mp.Process(target=worker_task, args=(mid, config, csv_path))
         p.start()
-        p.join() # Wait for the machine to finish before starting the next one
+        p.join() 
 
 def worker_task(mid, config, csv_path):
-    """
-    This runs in a completely isolated memory space.
-    When this function finishes, the process dies and RAM is freed.
-    """
     try:
-        # We need to limit TF memory growth inside the worker
         gpus = tf.config.experimental.list_physical_devices('GPU')
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
@@ -155,12 +146,12 @@ def main(config_path, run_all=False):
     if run_all:
         run_all_machines(config)
     else:
-        # Default single run logic
+        # Default single machine test
         mid = "machine-1-1"
         auc, fc1, pa_auc = train_on_machine(mid, config)
         
         os.makedirs("results", exist_ok=True)
-        csv_path = "results/acae_jerk_smd_results.csv"
+        csv_path = "results/acae_jerk_smd_uni_11.csv"
         file_exists = os.path.isfile(csv_path)
         with open(csv_path, "a", newline="") as f:
             writer = csv.writer(f)
