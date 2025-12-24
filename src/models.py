@@ -1,9 +1,14 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models, regularizers
 
+# Use namespace as per your preference
 namespace = tf.keras
 
 class ResidualBlock(layers.Layer):
+    """
+    Stabilizes gradient flow for the Hamiltonian network.
+    Mirroring the ResNet-1D architecture from the paper[cite: 387].
+    """
     def __init__(self, units, dropout=0.1, **kwargs):
         super(ResidualBlock, self).__init__(**kwargs)
         self.units = units
@@ -28,11 +33,13 @@ class ResidualBlock(layers.Layer):
         x = self.dense2(x)
         if self.shortcut_layer:
             shortcut = self.shortcut_layer(shortcut)
-        return layers.Add()([x, shortcut])
+        # FIX: Use raw tensor addition instead of instantiating layers.Add() in call
+        return x + shortcut
 
 class SymplecticLeapfrogLayer(layers.Layer):
     """
-    The Physics Engine. Explicitly tracks sub-model weights for the optimizer.
+    The Physics Engine. Replaces the 1D-CNN backbone.
+    dq/dt = dH/dp, dp/dt = -dH/dq.
     """
     def __init__(self, feature_dim=128, steps=3, dt=0.1, **kwargs):
         super(SymplecticLeapfrogLayer, self).__init__(**kwargs)
@@ -40,47 +47,39 @@ class SymplecticLeapfrogLayer(layers.Layer):
         self.steps = steps
         self.dt = dt
         
-        # Define H(q, p) with an explicit InputLayer to finalize weights [cite: 387, 544]
-        self.h_net = models.Sequential([
-            layers.Input(shape=(feature_dim * 2,)), 
-            ResidualBlock(256),
-            ResidualBlock(256),
-            layers.Dense(1) 
-        ])
-
-    def build(self, input_shape):
-        # Force-build the sub-model so dense_4/bias exists before training 
-        if not self.h_net.built:
-            self.h_net.build((None, self.feature_dim * 2))
-        super(SymplecticLeapfrogLayer, self).build(input_shape)
-
-    @property
-    def trainable_variables(self):
-        # EXPLICIT REGISTRATION: Bubbles internal weights up to the Encoder 
-        return super(SymplecticLeapfrogLayer, self).trainable_variables + self.h_net.trainable_variables
+        # Scalar Energy Function H(q, p)
+        # We use a pure MLP here to ensure a smooth second-order gradient path.
+        self.h_dense1 = layers.Dense(256, activation='tanh')
+        self.h_dense2 = layers.Dense(256, activation='tanh')
+        # FIX: use_bias=False prevents the "No gradients exist" warning for bias
+        self.h_out = layers.Dense(1, use_bias=False, name="h_out") 
 
     def get_gradients(self, q, p):
         state_p = tf.concat([q, p], axis=-1)
         with tf.GradientTape() as tape:
             tape.watch(state_p)
-            H = self.h_net(state_p)
+            x = self.h_dense1(state_p)
+            x = self.h_dense2(x)
+            H = self.h_out(x)
         dH = tape.gradient(H, state_p)
-        # Physics flow: dq/dt = dH/dp, dp/dt = -dH/dq
         return dH[:, self.feature_dim:], -dH[:, :self.feature_dim]
 
     def call(self, x):
+        # Extract initial canonical coordinates
         q = x[:, -1, :] 
         p = x[:, -1, :] - x[:, -2, :] 
+        
         for _ in range(self.steps):
             dq, dp = self.get_gradients(q, p)
             p = p + 0.5 * self.dt * dp
             q = q + self.dt * dq
             _, dp_final = self.get_gradients(q, p)
             p = p + 0.5 * self.dt * dp_final
+            
         return tf.concat([q, p], axis=-1)
 
 def build_projection_head(input_shape=(64, 22)):
-    # Mirroring the paper's multi-scale conv architecture [cite: 338, 380]
+    # Matches the paper's multi-scale architecture [cite: 338, 380]
     inputs = layers.Input(shape=input_shape)
     x = layers.Conv1D(128, 1, padding='same', activation='tanh')(inputs)
     x = layers.Conv1D(128, 3, padding='same', activation='tanh')(x)
@@ -96,7 +95,7 @@ def build_encoder(input_shape=(64, 22), latent_dim=256):
     return models.Model(inputs, z, name="Encoder")
 
 def build_decoder(latent_dim=256, output_steps=64, output_features=22):
-    # Precise inverse of the encoder to facilitate robust reconstruction [cite: 467, 472]
+    # Precise inverse of the encoder [cite: 467, 472]
     z_input = layers.Input(shape=(latent_dim,))
     x = layers.Dense(512, activation='tanh')(z_input)
     x = ResidualBlock(512)(x)

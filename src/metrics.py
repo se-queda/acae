@@ -1,6 +1,7 @@
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
+from sklearn.metrics import precision_recall_fscore_support
 
 def _segments_from_labels(labels):
     """
@@ -137,51 +138,38 @@ def _f1_from_preds(preds, labels):
     return 2 * precision * recall / (precision + recall)
 
 
+
 def compute_pa_k_auc(scores, labels, base_threshold=None, k_values=None):
     """
-    PA%K as described by Kim et al. (2022):
-
-    - For each K in k_values:
-        1) Threshold scores into preds (if base_threshold is None, use
-           median or another heuristic; you can also pass a pre-optimized threshold).
-        2) Apply point adjustment at K: segments become +1 if fraction
-           of positives in the segment >= K.
-        3) Compute point-wise F1 between adjusted preds and labels.
-    - Return the area under the K-F1 curve (simple trapezoidal integration).
-
-    Args:
-        scores: 1D array of anomaly scores.
-        labels: 1D array of 0/1 labels.
-        base_threshold: scalar thr for scores -> preds. If None, uses median.
-        k_values: iterable of K in [0, 1]. If None, default 0.1..1.0.
-
-    Returns:
-        pa_auc: scalar, approximate area under PA%K curve.
-        ks: K values used.
-        f1s: F1 at each K.
+    Fixed PA%K to match the paper's methodology.
+    1. Includes K=0 to K=1.0 for the full area.
+    2. Uses a dense 50-point grid for integration.
     """
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels).astype(int)
 
     if base_threshold is None:
-        # Heuristic: median score as base threshold
         base_threshold = float(np.median(scores))
 
+    # Threshold once for efficiency
     preds_raw = (scores > base_threshold).astype(int)
 
     if k_values is None:
-        # Example grid: 0.1, 0.2, ..., 1.0
-        k_values = np.linspace(0.1, 1.0, 10)
+        # Paper uses a "series of values"[cite: 517]. 
+        # Standard PA%K AUC integrates from 0 to 1.
+        k_values = np.linspace(0.0, 1.0, 51) 
 
     f1s = []
     for K in k_values:
         adjusted = _point_adjustment_at_k(preds_raw, labels, K)
+        # Point-wise F1 on the adjusted sequence
         f1 = _f1_from_preds(adjusted, labels)
         f1s.append(f1)
 
     ks = np.array(k_values, dtype=float)
     f1s = np.array(f1s, dtype=float)
 
-    # Area under K-F1 curve using trapezoidal rule
-    pa_auc = np.trapz(f1s, ks) / (ks[-1] - ks[0])  # normalize by K-range
+    # Area under curve via trapezoidal rule
+    # Normalized by range (1.0), so result is in [0, 1]
+    pa_auc = np.trapz(f1s, ks) 
     return pa_auc, ks, f1s

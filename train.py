@@ -23,56 +23,62 @@ def load_config(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-def get_best_f1(scores, labels, step_size=200):
+def get_best_metrics(scores, labels, step_size=100):
+    """
+    Optimizes independently for Fc1 and PA%K AUC.
+    Returns only the best scores achieved for each.
+    """
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels).astype(int)
     min_score, max_score = np.min(scores), np.max(scores)
+    
     if min_score == max_score:
-        return 0.0, 0.0, 0.0, max_score
+        return 0.0, 0.0
 
     thresholds = np.linspace(min_score, max_score, step_size)
-    best_f1, best_precision, best_recall, best_thresh = 0.0, 0.0, 0.0, thresholds[0]
+    
+    best_fc1 = 0.0
+    best_pa_auc = 0.0
 
     for thresh in thresholds:
         preds = (scores > thresh).astype(int)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            labels, preds, average="binary", zero_division=0
-        )
-        if f1 > best_f1:
-            best_f1, best_precision, best_recall, best_thresh = f1, precision, recall, thresh
+        
+        # 1. Optimize for Fc1 (Event-wise Recall + Time-wise Precision)
+        # This is the actual metric reported in the paper 
+        current_fc1 = compute_fc1(preds, labels)
+        if current_fc1 > best_fc1:
+            best_fc1 = current_fc1
+            
+        # 2. Optimize for PA%K AUC (Integration of adjusted F1s)
+        # Calculated across K=0.0 to 1.0 per paper guidelines 
+        current_pa_auc, _, _ = compute_pa_k_auc(scores, labels, base_threshold=thresh)
+        if current_pa_auc > best_pa_auc:
+            best_pa_auc = current_pa_auc
 
-    return best_f1, best_precision, best_recall, best_thresh
+    return best_fc1, best_pa_auc
 
 def train_on_machine(machine_id, config):
     print(f"\n🚀 Starting High-Res HNN Training: {machine_id}")
 
-    # 1. Load Data
-    # Utilizing the full 64-step resolution for HNN stability
+    # 1. Load Data (64-step resolution for HNN stability)
     train_w, test_w, test_labels_pointwise, _, _ = load_smd_windows(
         data_root=config.get("data_root", "/home/utsab/Downloads/smd/ServerMachineDataset"),
         machine_id=machine_id,
         window=64,
-        train_stride=2, # Balancing coverage and speed
+        train_stride=2, 
     )
 
     train_ds, val_ds, test_ds = build_tf_datasets(
         train_w, test_w, val_split=0.2, batch_size=config["batch_size"],
     )
 
-    # 2. Build Models (No more pooling in the Projection Head)
+    # 2. Build Models
     features = train_w.shape[-1]
-    
-    # Encoder: Raw Windows (64 steps) -> HNN -> Latent Space
     encoder = build_encoder(input_shape=(64, features), latent_dim=config["latent_dim"])
-    
-    # Decoder: Mirroring the HNN flow back to sensor space
     decoder = build_decoder(latent_dim=config["latent_dim"], output_steps=64, output_features=features)
-    
-    # Adversarial Component
     discriminator = build_discriminator(latent_dim=config["latent_dim"])
 
     # 3. Trainer
-    # Driving the Sobolev loss (Position + Momentum)
     trainer = ACAETrainer(
         encoder=encoder,
         decoder=decoder,
@@ -84,46 +90,45 @@ def train_on_machine(machine_id, config):
 
     # 4. Evaluation: Physics-Informed Anomaly Scoring
     _, reconstructions = trainer.reconstruct(test_ds)
-    
-    # Shape: (N_windows, 64, features)
     originals = test_w 
     
     # Point-wise Euclidean Error (Position)
     mse_error = np.square(originals - reconstructions)
     
     # Momentum Error (Temporal Gradient Match)
-    # We calculate the delta between steps to see if the 'flow' is broken
     v_orig = originals[:, 1:, :] - originals[:, :-1, :]
     v_hat = reconstructions[:, 1:, :] - reconstructions[:, :-1, :]
     mom_error = np.square(v_orig - v_hat)
     
-    # Combine errors: MSE + 0.5 * Momentum (matching our training objective)
-    # We pad the mom_error to match the original window length
+    # Combine errors: MSE + Momentum
     mom_error_padded = np.pad(mom_error, ((0,0), (1,0), (0,0)), mode='edge')
     combined_error = mse_error + (config.get("lambda_mom", 0.5) * mom_error_padded)
     
-    # Flatten for point-wise scoring across all sensors
-    point_scores = np.sum(combined_error, axis=(1, 2))
+    # --- Dimension Alignment ---
+    point_scores = np.sum(combined_error, axis=-1).flatten() 
 
+    # Align lengths
     min_len = min(len(point_scores), len(test_labels_pointwise))
-    point_scores, test_labels_pointwise = point_scores[:min_len], test_labels_pointwise[:min_len]
+    point_scores = point_scores[:min_len]
+    test_labels_pointwise = test_labels_pointwise[:min_len]
 
-    # Metrics
-    auc = compute_auc(point_scores, test_labels_pointwise)
-    best_f1, prec_pt, rec_pt, thr = get_best_f1(point_scores, test_labels_pointwise)
-    preds = (point_scores > thr).astype(int)
-    fc1 = compute_fc1(preds, test_labels_pointwise)
-    pa_auc, _, _ = compute_pa_k_auc(point_scores, test_labels_pointwise, base_threshold=thr)
+# --- INDEPENDENT METRIC OPTIMIZATION ---
+    # We find the peak performance for each metric independently 
+    # to match the paper's "approximate optimal threshold" protocol 
+    fc1_score, pa_auc_score = get_best_metrics(point_scores, test_labels_pointwise)
 
-    print(f"✅ {machine_id} -> AUC: {auc:.4f} | Fc1: {fc1:.4f} | PA%K: {pa_auc:.4f}")
+    # AUC is threshold-independent, so it's calculated separately [cite: 510]
+    auc_score = compute_auc(point_scores, test_labels_pointwise)
 
-    # 5. Aggressive Memory Cleanup
+    print(f"✅ {machine_id} -> AUC: {auc_score:.4f} | Fc1: {fc1_score:.4f} | PA%K: {pa_auc_score:.4f}")
+
+    # 5. Memory Cleanup
     del train_w, test_w, train_ds, val_ds, test_ds
     del trainer, encoder, decoder, discriminator
     K.clear_session()
     gc.collect()
 
-    return auc, fc1, pa_auc
+    return auc_score, fc1_score, pa_auc_score
 
 def run_all_machines(config):
     machine_ids = [
