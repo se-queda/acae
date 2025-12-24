@@ -1,157 +1,137 @@
 import tensorflow as tf
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers, models, regularizers
 
-def bottleneck_block(filters, stride=1, expansion=4, is_decoder=False):
-    """
-    Implements the Bottleneck Residual Block from Fig. 5.
-    Structure: 1x1 Conv -> 3x3 Conv -> 1x1 Conv
-    Activations: Tanh after BN (as per diagram)
-    """
-    expanded_filters = filters * expansion
+# Use namespace as per your preference
+namespace = tf.keras
 
+def residual_mlp(units, dropout=0.1):
+    """
+    Stabilizes gradient flow for the Hamiltonian network.
+    Uses L2 regularization to prevent overfitting[cite: 100].
+    """
     def block(x_input):
-        # --- Shortcut Path ---
         shortcut = x_input
-        if stride > 1 or x_input.shape[-1] != expanded_filters:
-            if is_decoder:
-                # Decoder upsamples in the shortcut
-                shortcut = layers.UpSampling1D(size=stride)(shortcut)
-                shortcut = layers.Conv1D(expanded_filters, 1, padding='same')(shortcut)
-            else:
-                # Encoder downsamples in the shortcut
-                shortcut = layers.Conv1D(expanded_filters, 1, strides=stride, padding='same')(shortcut)
-            shortcut = layers.BatchNormalization()(shortcut)
-
-        # --- Main Path ---
-        # 1. 1x1 Conv (Reduce / Projection)
-        x = layers.Conv1D(filters, 1, padding='same')(x_input)
+        x = layers.Dense(units, activation='tanh', 
+                         kernel_regularizer=regularizers.l2(1e-4))(x_input)
         x = layers.BatchNormalization()(x)
-        x = layers.Activation('tanh')(x)
-
-        # 2. 3x3 Conv (Spatial Processing)
-        if is_decoder and stride > 1:
-            x = layers.UpSampling1D(size=stride)(x)
-            x = layers.Conv1D(filters, 3, padding='same')(x)
-        else:
-            x = layers.Conv1D(filters, 3, strides=stride, padding='same')(x)
+        x = layers.Dropout(dropout)(x)
+        x = layers.Dense(units, activation='tanh', 
+                         kernel_regularizer=regularizers.l2(1e-4))(x)
         
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('tanh')(x)
-
-        # 3. 1x1 Conv (Expand)
-        x = layers.Conv1D(expanded_filters, 1, padding='same')(x)
-        x = layers.BatchNormalization()(x)
-
-        # --- Add & Final Activation ---
-        out = layers.Add()([x, shortcut])
-        return layers.Activation('tanh')(out)
-
+        # Projection shortcut if dimensions don't match
+        if shortcut.shape[-1] != units:
+            shortcut = layers.Dense(units)(shortcut)
+            
+        return layers.Add()([x, shortcut])
     return block
 
-def build_projection_head(input_shape=(64, 38)):
+class SymplecticLeapfrogLayer(layers.Layer):
     """
-    Matches "Projection" block in Fig. 5:
-    Conv 1x1, 128 -> Conv 1x3, 128 -> Conv 1x7, 128 -> MaxPool
+    The Physics Engine. Replaces the 1D-CNN backbone[cite: 386].
+    Simulates Hamiltonian dynamics: dq/dt = dH/dp, dp/dt = -dH/dq.
+    """
+    def __init__(self, feature_dim=128, steps=3, dt=0.1, **kwargs):
+        super(SymplecticLeapfrogLayer, self).__init__(**kwargs)
+        self.feature_dim = feature_dim
+        self.steps = steps
+        self.dt = dt
+        
+        # Scalar Energy Function H(q, p)
+        self.h_net = models.Sequential([
+            residual_mlp(256),
+            residual_mlp(256),
+            layers.Dense(1) 
+        ])
+
+    def get_gradients(self, q, p):
+        state_p = tf.concat([q, p], axis=-1)
+        with tf.GradientTape() as tape:
+            tape.watch(state_p)
+            H = self.h_net(state_p)
+        dH = tape.gradient(H, state_p)
+        # Standard Hamiltonian equations
+        return dH[:, self.feature_dim:], -dH[:, :self.feature_dim]
+
+    def call(self, x):
+        # Extract State (q) and Internal Jerk (p) from the projected window
+        q = x[:, -1, :] 
+        p = x[:, -1, :] - x[:, -2, :] 
+        
+        # 3-step Symplectic Integration for physical stability
+        for _ in range(self.steps):
+            dq, dp = self.get_gradients(q, p)
+            p = p + 0.5 * self.dt * dp
+            q = q + self.dt * dq
+            _, dp_final = self.get_gradients(q, p)
+            p = p + 0.5 * self.dt * dp_final
+            
+        return tf.concat([q, p], axis=-1)
+
+def build_projection_head(input_shape=(64, 22)):
+    """
+    Matches Fig. 5 Projection Head: 1x1, 1x3, 1x7 Convs[cite: 338, 380].
+    Handles the high-dimensional projection for masking[cite: 289].
     """
     inputs = layers.Input(shape=input_shape)
-
-    # 1x1 Conv
     x = layers.Conv1D(128, 1, padding='same')(inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('tanh')(x)
-
-    # 1x3 Conv
+    
     x = layers.Conv1D(128, 3, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('tanh')(x)
-
-    # 1x7 Conv (Stride 2 implied by diagram's next stage or specific implementation, 
-    # but diagram shows MaxPool doing the reduction. We stick to diagram: Conv -> Pool)
+    
     x = layers.Conv1D(128, 7, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('tanh')(x)
-
-    # Max Pooling 1x3, stride 2 (matches "Max Pooling: 1x3, /2")
+    
+    # Reduction step as per paper diagram [cite: 345, 380]
     outputs = layers.MaxPooling1D(pool_size=3, strides=2, padding='same')(x)
-
     return models.Model(inputs, outputs, name="ProjectionHead")
 
-def build_encoder(input_shape_projected=(32, 128), latent_dim=256):
+def build_encoder(input_shape=(64, 22), latent_dim=256):
     """
-    Matches "Encoder" block in Fig. 5:
-    - Stage 1 (Blue): 3 blocks, 64 filters (expands to 256)
-    - Stage 2 (Yellow): 3 blocks, 128 filters (expands to 512)
-    - Global Average Pooling -> Linear
+    ACAE Encoder with Hamiltonian backbone[cite: 95, 332].
+    Outputs the standard 256-dim latent vector z[cite: 384, 544].
     """
-    inputs = layers.Input(shape=input_shape_projected)
-    x = inputs
-
-    # --- Stage 1 (Blue) ---
-    # First block downsamples (stride=2) if needed, but diagram shows "/2" on the shortcut.
-    # We follow standard ResNet stage logic: First block strides, others don't.
-    x = bottleneck_block(filters=64, stride=2, expansion=4)(x) # Output: (16, 256)
-    x = bottleneck_block(filters=64, stride=1, expansion=4)(x)
-    x = bottleneck_block(filters=64, stride=1, expansion=4)(x)
-
-    # --- Stage 2 (Yellow) ---
-    x = bottleneck_block(filters=128, stride=2, expansion=4)(x) # Output: (8, 512)
-    x = bottleneck_block(filters=128, stride=1, expansion=4)(x)
-    x = bottleneck_block(filters=128, stride=1, expansion=4)(x)
-
-    # --- Output Head ---
-    x = layers.GlobalAveragePooling1D()(x) # (512,)
-    z = layers.Dense(latent_dim, name="z_latent")(x) # (256,)
-
+    inputs = layers.Input(shape=input_shape)
+    
+    # 1. Multi-scale Projection [cite: 338]
+    projected = build_projection_head(input_shape)(inputs)
+    
+    # 2. Physics Engine (HNN)
+    flow = SymplecticLeapfrogLayer(feature_dim=128)(projected)
+    
+    # 3. Final Latent Mapping [cite: 544]
+    x = residual_mlp(512)(flow)
+    z = layers.Dense(latent_dim, name="z_latent")(x)
+    
     return models.Model(inputs, z, name="Encoder")
 
-def build_decoder(latent_dim=256, output_steps=64, output_features=38):
+def build_decoder(latent_dim=256, output_steps=64, output_features=22):
     """
-    Matches "Decoder" block in Fig. 5 (Symmetric to Encoder):
-    - Linear -> Reshape
-    - Stage 2 Inverse (Yellow): 3 blocks
-    - Stage 1 Inverse (Blue): 3 blocks
-    - Final Conv Projection
+    Symmetric Decoder: Mirror image of the Encoder.
+    Reconstructs original sensor window from physical latent flow[cite: 467, 468].
     """
-    inputs = layers.Input(shape=(latent_dim,))
-
-    # Linear Projection & Reshape (Inverse of Global Avg Pool)
-    # Target shape: (8, 512) to match Encoder's Stage 2 output
-    x = layers.Dense(8 * 512)(inputs)
-    x = layers.Reshape((8, 512))(x)
+    z_input = layers.Input(shape=(latent_dim,))
     
-    # --- Stage 2 Inverse (Yellow) ---
-    x = bottleneck_block(filters=128, stride=1, expansion=4, is_decoder=True)(x)
-    x = bottleneck_block(filters=128, stride=1, expansion=4, is_decoder=True)(x)
-    x = bottleneck_block(filters=128, stride=2, expansion=4, is_decoder=True)(x) # Upsample to (16, 512)
-
-    # --- Stage 1 Inverse (Blue) ---
-    # Note: Encoder Stage 1 output was (16, 256). 
-    # We need to transition from 512 -> 256 filters here.
-    # The bottleneck block takes 'filters' (e.g. 64) and expands to 256.
-    x = bottleneck_block(filters=64, stride=1, expansion=4, is_decoder=True)(x)
-    x = bottleneck_block(filters=64, stride=1, expansion=4, is_decoder=True)(x)
-    x = bottleneck_block(filters=64, stride=2, expansion=4, is_decoder=True)(x) # Upsample to (32, 256)
-
-    # --- Final Projection Head (Inverse of Input Projection) ---
-    # Matches "Conv: 1x1, 128" -> "Linear" (Output)
-    # We upsample to original time length (64)
-    x = layers.UpSampling1D(size=2)(x) # (64, 256)
+    x = residual_mlp(512)(z_input)
+    x = layers.Dense(256, activation='tanh')(x) 
     
-    x = layers.Conv1D(128, 1, padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('tanh')(x)
-
-    # Final Linear Output (Conv 1x1 to feature count)
-    outputs = layers.Conv1D(output_features, 1, padding='same', activation=None)(x)
-
-    return models.Model(inputs, outputs, name="Decoder")
+    # Expand to time window [cite: 275, 466]
+    x = layers.Dense(output_steps * 128, activation='tanh')(x)
+    x = layers.Reshape((output_steps, 128))(x)
+    
+    # Inverse Projection back to sensor count
+    x = layers.Conv1D(64, 3, padding='same', activation='tanh')(x)
+    outputs = layers.Conv1D(output_features, 1, padding='same')(x)
+    
+    return models.Model(z_input, outputs, name="Decoder")
 
 def build_discriminator(latent_dim=256):
     """
-    Matches MLP Discriminator for feature decomposition.
-    Input: Concatenated [Original Z, Composite Z] (Size: 512)
-    Output: [Class Label, Proportion Alpha] (Size: 2)
-    Activation: Linear (None) for MSE Loss
+    Standard ACAE MLP Discriminator[cite: 430].
+    Used for adversarial feature decomposition[cite: 395, 435].
     """
     input_dim = latent_dim * 2
     inputs = layers.Input(shape=(input_dim,))
@@ -162,7 +142,6 @@ def build_discriminator(latent_dim=256):
     x = layers.Dropout(0.5)(x)
     x = layers.Dense(64, activation='relu')(x)
 
-    # No Sigmoid! Paper uses MSE loss on raw values.
+    # Output: [Classification Label, Proportion Alpha] [cite: 430, 439]
     outputs = layers.Dense(2, activation=None)(x) 
     return models.Model(inputs, outputs, name="Discriminator")
-

@@ -1,17 +1,22 @@
 # Model Hyperparameters
-latent_dim: 256 # Dimension of the latent vector z
-batch_size: 128 # Batch size for training
-lr: 0.0001 # Learning rate for Adam optimizer
+latent_dim: 256        # Dimension of the latent vector z [cite: 544]
+batch_size: 128        # Batch size for training [cite: 545]
+lr: 0.0001             # Learning rate for Adam optimizer [cite: 546]
+
+# --- NEW: Hamiltonian Physics Parameters ---
+# These control the Leapfrog Integration (dq/dt, dp/dt)
+hnn_steps: 3           # Number of leapfrog integration steps
+hnn_dt: 0.1            # Time delta for each integration step
+hnn_feature_dim: 128   # Matches the Projection Head output dimension [cite: 338]
 
 # Loss Weights
-lambda_d: 1.0 # Weight for Discriminator loss
-lambda_e: 1.0 # Weight for Adversarial Encoder loss
-recon_weight: 1.0 # Weight for Reconstruction loss
+lambda_d: 1.0          # Weight for Discriminator loss [cite: 476, 478]
+lambda_e: 1.0          # Weight for Adversarial Encoder loss [cite: 476, 478]
+recon_weight: 1.0      # Weight for Reconstruction loss [cite: 476]
 
+# Weighted Loss Parameters (Physics-Informed)
+alpha_vpo: 10.0        # High penalty for high-jerk (momentum) anomalies
 
 # Training Loop
-epochs: 200 # Number of epochs to train
-
-
-#weighted loss parameters
-alpha_vpo: 10.0 # Weight factor for velocity pointwise loss
+epochs: 200            # Standard max epochs [cite: 545]
+patience: 5            # Early stopping patience if val_recon stalls [cite: 545]
