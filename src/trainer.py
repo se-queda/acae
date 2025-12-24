@@ -16,6 +16,7 @@ class ACAETrainer:
         self.lambda_e = config.get("lambda_e", 1.0)
         self.recon_weight = config.get("recon_weight", 1.0)
         self.lr = config.get("lr", 1e-4)
+        self.alpha_vpo = config.get("alpha_vpo", 2.0)
 
         self.enc_dec_optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr, weight_decay=1e-4)
         self.disc_optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr, weight_decay=1e-4)
@@ -29,12 +30,18 @@ class ACAETrainer:
     def _train_step(self, packed_batch):
         packed_batch = tf.cast(packed_batch, tf.float32)
         anchor = packed_batch[:, 0, :, :]        
-        physics_views = packed_batch[:, 1:, :, :] 
+        physics_views = packed_batch[:, 1:, :, :]
+        jerk_w = packed_batch[:, 5, :, :]
+        
 
         with tf.GradientTape(persistent=True) as tape:
             z = self.encoder(self.projection_head(anchor, training=True), training=True)
             x_hat = self.decoder(z, training=True)
-            recon_loss = tf.reduce_mean(tf.square(anchor - x_hat))
+            j_abs = tf.abs(jerk_w)
+            j_thresh = tf.reduce_mean(j_abs) + tf.math.reduce_std(j_abs)
+            vpo_weights = tf.where(j_abs > j_thresh, self.alpha_vpo, 1.0)
+            pointwise_error = tf.square(anchor - x_hat)
+            recon_loss = tf.reduce_mean(pointwise_error * vpo_weights)
 
             z_pos_all, alpha_all = [], []
             for i in range(4):

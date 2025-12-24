@@ -102,18 +102,23 @@ def train_on_machine(machine_id, config):
     return auc, fc1, pa_auc
 
 def run_all_machines(config):
-    # UPDATED: Only the 11 target machines for the No-Veto experiment
     machine_ids = [
-        # Set 1
-        "machine-1-3", "machine-1-4", "machine-1-8", 
-        # Set 2
-        "machine-2-1", "machine-2-2", "machine-2-3", "machine-2-9",
-        # Set 3
-        "machine-3-2", "machine-3-3", "machine-3-7", "machine-3-11"
-    ]
+    # Group 1
+    "machine-1-1", "machine-1-2", "machine-1-3", "machine-1-4", 
+    "machine-1-5", "machine-1-6", "machine-1-7", "machine-1-8",
+    
+    # Group 2
+    "machine-2-1", "machine-2-2", "machine-2-3", "machine-2-4", 
+    "machine-2-5", "machine-2-6", "machine-2-7", "machine-2-8", "machine-2-9",
+    
+    # Group 3
+    "machine-3-1", "machine-3-2", "machine-3-3", "machine-3-4", 
+    "machine-3-5", "machine-3-6", "machine-3-7", "machine-3-8", 
+    "machine-3-9", "machine-3-10", "machine-3-11"
+]
     
     os.makedirs("results", exist_ok=True)
-    csv_path = "results/acae_jerk_smd_uni_11.csv"
+    csv_path = "results/acae_jerk_smd_consensusMask.csv"
 
     if not os.path.isfile(csv_path):
         with open(csv_path, "w", newline="") as f:
@@ -151,7 +156,7 @@ def main(config_path, run_all=False):
         auc, fc1, pa_auc = train_on_machine(mid, config)
         
         os.makedirs("results", exist_ok=True)
-        csv_path = "results/acae_jerk_smd_uni_11.csv"
+        csv_path = "results/mini_expriment_2.csv"
         file_exists = os.path.isfile(csv_path)
         with open(csv_path, "a", newline="") as f:
             writer = csv.writer(f)

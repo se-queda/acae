@@ -59,4 +59,56 @@ def univariate_masker(data_windows, jerk_windows):
     return views[0], views[1], views[2], views[3]
 
 
-get_masked_views = univariate_masker
+def consensus_masker(data_windows, jerk_windows, cluster_labels):
+    """
+    The Final Algorithm:
+    1. Runs the univariate masker for all 4 percentiles.
+    2. For each view and each window, checks for cluster-wide agreement.
+    3. If a masked feature's cluster isn't 100% masked, the whole cluster is unmasked.
+    """
+    # Step 1: Get the 4 percentile views from the univariate masker
+    base_views = univariate_masker(data_windows, jerk_windows)
+    
+    N, T, F = data_windows.shape
+    final_views = []
+
+    for v_tier in base_views:
+        # Pre-identify which (window, feature) pairs are masked (where data is zeroed)
+        # Shape: (N, F)
+        is_masked = np.all(v_tier == 0.0, axis=1)
+        
+        # Working copy for the consensus adjustments
+        v_consensus = v_tier.copy()
+
+        for n in range(N):
+            processed_clusters = set() # Track processed clusters for this window
+            
+            for f in range(F):
+                c_id = cluster_labels[f]
+                
+                # Skip if we already validated or vetoed this cluster in this window
+                if c_id in processed_clusters:
+                    continue
+                
+                # Check if this feature is masked
+                if is_masked[n, f]:
+                    # Find all features belonging to this cluster
+                    c_indices = np.where(cluster_labels == c_id)[0]
+                    
+                    # CONSENSUS CHECK: Are ALL features in this cluster masked?
+                    if np.all(is_masked[n, c_indices]):
+                        # Cluster consensus reached: keep the mask
+                        pass
+                    else:
+                        # VETO: Cluster does not agree. Unmask everyone in the group.
+                        v_consensus[n, :, c_indices] = data_windows[n, :, c_indices]
+                    
+                    # Mark this cluster as done for this window
+                    processed_clusters.add(c_id)
+        
+        final_views.append(v_consensus)
+
+    return tuple(final_views)
+
+# Point the main entry point to the new consensus logic
+get_masked_views = consensus_masker
