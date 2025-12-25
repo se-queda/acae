@@ -9,13 +9,8 @@ from tensorflow.keras import backend as K
 import tensorflow as tf
 import multiprocessing as mp
 
-# Updated components as per our HNN design
-from src.trainer import ACAETrainer
-from src.models import (
-    build_encoder,
-    build_decoder,
-    build_discriminator
-)
+from src.trainer import DualAnchorACAETrainer
+from src.models import build_dual_encoder, build_dual_decoder, build_discriminator
 from src.utils import load_smd_windows, build_tf_datasets
 from src.metrics import compute_auc, compute_fc1, compute_pa_k_auc
 
@@ -58,73 +53,81 @@ def get_best_metrics(scores, labels, step_size=100):
     return best_fc1, best_pa_auc
 
 def train_on_machine(machine_id, config):
-    print(f"\n🚀 Starting High-Res HNN Training: {machine_id}")
+    print(f"\n🚀 K-SHIELD Engine Deployment: {machine_id}")
 
-    # 1. Load Data (64-step resolution for HNN stability)
-    train_w, test_w, test_labels_pointwise, _, _ = load_smd_windows(
+    # 1. Load & Build (Already includes Index-5 Jerk view)
+    train_final, test_final, test_labels, _, _ = load_smd_windows(
         data_root=config.get("data_root", "/home/utsab/Downloads/smd/ServerMachineDataset"),
         machine_id=machine_id,
         window=64,
-        train_stride=2, 
+        train_stride=config.get("stride", 1)
     )
+    
+    topo = train_final['topology']
+    phy_dim = len(topo.idx_phy)
+    res_dim = len(topo.idx_res)
 
     train_ds, val_ds, test_ds = build_tf_datasets(
-        train_w, test_w, val_split=0.2, batch_size=config["batch_size"],
+        train_final, test_final, 
+        val_split=0.2, 
+        batch_size=config["batch_size"]
     )
 
-    # 2. Build Models
-    features = train_w.shape[-1]
-    encoder = build_encoder(input_shape=(64, features), latent_dim=config["latent_dim"])
-    decoder = build_decoder(latent_dim=config["latent_dim"], output_steps=64, output_features=features)
+    # 2. Build & Train
+    encoder = build_dual_encoder(input_shape_sys=(64, phy_dim), input_shape_res=(64, res_dim))
+    decoder = build_dual_decoder(feat_sys=phy_dim, feat_res=res_dim)
     discriminator = build_discriminator(latent_dim=config["latent_dim"])
 
-    # 3. Trainer
-    trainer = ACAETrainer(
-        encoder=encoder,
-        decoder=decoder,
-        discriminator=discriminator,
-        config=config,
+    trainer = DualAnchorACAETrainer(
+        encoder=encoder, decoder=decoder, discriminator=discriminator,
+        config=config, topology=topo
     )
     
     trainer.fit(train_ds, val_ds=val_ds, epochs=config["epochs"])
 
-    # 4. Evaluation: Physics-Informed Anomaly Scoring
-    _, reconstructions = trainer.reconstruct(test_ds)
-    originals = test_w 
+    # 3. Gated Anomaly Scoring (INFERENCE)
+    recons = trainer.reconstruct(test_final)
     
-    # Point-wise Euclidean Error (Position)
-    mse_error = np.square(originals - reconstructions)
+    # --- 3a. Extract Jerk from View-5 ---
+    # recons['phy_orig'] is actually the full views tensor: (N, 6, 64, phy_dim)
+    # View 0: Original Anchor
+    # View 5: Kinematic Hyper-Gradient (Jerk)
+    phy_anchor = recons['phy_orig'][:, 0, :, :]
+    phy_jerk   = recons['phy_orig'][:, 5, :, :] # This is the 'train_jerk_w' we packed
     
-    # Momentum Error (Temporal Gradient Match)
-    v_orig = originals[:, 1:, :] - originals[:, :-1, :]
-    v_hat = reconstructions[:, 1:, :] - reconstructions[:, :-1, :]
-    mom_error = np.square(v_orig - v_hat)
-    
-    # Combine errors: MSE + Momentum
-    mom_error_padded = np.pad(mom_error, ((0,0), (1,0), (0,0)), mode='edge')
-    combined_error = mse_error + (config.get("lambda_mom", 0.5) * mom_error_padded)
-    
-    # --- Dimension Alignment ---
-    point_scores = np.sum(combined_error, axis=-1).flatten() 
+    # Define VPO weights based on the packed jerk
+    j_thresh = np.mean(phy_jerk) + np.std(phy_jerk)
+    vpo_weights = np.where(phy_jerk > j_thresh, config.get("alpha_vpo", 10.0), 1.0)
 
-    # Align lengths
-    min_len = min(len(point_scores), len(test_labels_pointwise))
-    point_scores = point_scores[:min_len]
-    test_labels_pointwise = test_labels_pointwise[:min_len]
+    # --- 3b. Weighted Reconstruction Error ---
+    # Applying Alpha_VPO to the HNN path where Jerk is high
+    err_phy = np.mean(np.square(phy_anchor - recons['phy_hat']) * vpo_weights, axis=-1)
+    
+    # Residual breakdown
+    res_orig, res_hat = recons['res_orig'], recons['res_hat']
+    err_lone = np.mean(np.square(res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]), axis=-1)
+    err_dead = np.mean(np.square(res_orig[:, :, topo.res_to_dead_local] - 0.0), axis=-1)
 
-# --- INDEPENDENT METRIC OPTIMIZATION ---
-    # We find the peak performance for each metric independently 
-    # to match the paper's "approximate optimal threshold" protocol 
-    fc1_score, pa_auc_score = get_best_metrics(point_scores, test_labels_pointwise)
+    # --- 3c. Normalized SOTA Fusion ---
+    def normalize_score(s):
+        return (s - np.min(s)) / (np.max(s) - np.min(s) + 1e-6)
 
-    # AUC is threshold-independent, so it's calculated separately [cite: 510]
-    auc_score = compute_auc(point_scores, test_labels_pointwise)
+    # Combining the Physics (with VPO) and the Sentinel Guard
+    score_phy = normalize_score(err_phy)
+    score_res = normalize_score(err_lone + (10.0 * err_dead)) 
+    
+    combined_window_scores = score_phy + score_res
+    point_scores = combined_window_scores.flatten() 
+
+    # 4. Metric Optimization
+    min_len = min(len(point_scores), len(test_labels))
+    point_scores, test_labels = point_scores[:min_len], test_labels[:min_len]
+
+    fc1_score, pa_auc_score = get_best_metrics(point_scores, test_labels)
+    auc_score = compute_auc(point_scores, test_labels)
 
     print(f"✅ {machine_id} -> AUC: {auc_score:.4f} | Fc1: {fc1_score:.4f} | PA%K: {pa_auc_score:.4f}")
 
-    # 5. Memory Cleanup
-    del train_w, test_w, train_ds, val_ds, test_ds
-    del trainer, encoder, decoder, discriminator
     K.clear_session()
     gc.collect()
 
@@ -142,7 +145,7 @@ def run_all_machines(config):
     ]
     
     os.makedirs("results", exist_ok=True)
-    csv_path = "results/acae_hnn_sobolev_consensus.csv"
+    csv_path = "results/acae_hnn_sobolev_consensus_duaLatent.csv"
 
     if not os.path.isfile(csv_path):
         with open(csv_path, "w", newline="") as f:

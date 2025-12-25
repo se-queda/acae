@@ -86,25 +86,49 @@ def build_projection_head(input_shape=(64, 22)):
     x = layers.Conv1D(128, 7, padding='same', activation='tanh')(x)
     return models.Model(inputs, x, name="ProjectionHead")
 
-def build_encoder(input_shape=(64, 22), latent_dim=256):
-    inputs = layers.Input(shape=input_shape)
-    projected = build_projection_head(input_shape)(inputs)
-    flow = SymplecticLeapfrogLayer(feature_dim=128)(projected)
-    x = ResidualBlock(512)(flow)
-    z = layers.Dense(latent_dim, name="z_latent")(x)
-    return models.Model(inputs, z, name="Encoder")
+def build_dual_encoder(input_shape_sys, input_shape_res, latent_dim=256):
+    # Inputs for both anchors
+    inputs_sys = layers.Input(shape=input_shape_sys, name="input_sys")
+    inputs_res = layers.Input(shape=input_shape_res, name="input_res")
+    
+    # --- Branch A: System Dynamics (HNN) ---
+    proj_sys = build_projection_head(input_shape_sys)(inputs_sys)
+    flow = SymplecticLeapfrogLayer(feature_dim=128)(proj_sys)
+    x_sys = ResidualBlock(512)(flow)
+    z_sys = layers.Dense(latent_dim // 2, name="z_sys")(x_sys)
+    
+    # --- Branch B: Residual Sentinel (Identity) ---
+    # We use a simpler path for the lone-wolf/dead sensors 
+    # to avoid polluting the HNN manifold.
+    x_res = layers.Flatten()(inputs_res)
+    x_res = layers.Dense(256, activation='tanh')(x_res)
+    z_res = layers.Dense(latent_dim // 2, name="z_res")(x_res)
+    
+    # Concatenate for the Discriminator, but keep them separate for Decoders
+    z_combined = layers.Concatenate(name="z_combined")([z_sys, z_res])
+    
+    return models.Model([inputs_sys, inputs_res], [z_sys, z_res, z_combined], name="DualEncoder")
 
-def build_decoder(latent_dim=256, output_steps=64, output_features=22):
-    # Precise inverse of the encoder [cite: 467, 472]
-    z_input = layers.Input(shape=(latent_dim,))
-    x = layers.Dense(512, activation='tanh')(z_input)
-    x = ResidualBlock(512)(x)
-    x = layers.Dense(output_steps * 128, activation='tanh')(x)
-    x = layers.Reshape((output_steps, 128))(x)
-    x = layers.Conv1D(128, 7, padding='same', activation='tanh')(x)
-    x = layers.Conv1D(128, 3, padding='same', activation='tanh')(x)
-    outputs = layers.Conv1D(output_features, 1, padding='same')(x)
-    return models.Model(z_input, outputs, name="Decoder")
+def build_dual_decoder(latent_dim=256, output_steps=64, feat_sys=22, feat_res=16):
+    # We use half the latent for each branch
+    z_sys_in = layers.Input(shape=(latent_dim // 2,))
+    z_res_in = layers.Input(shape=(latent_dim // 2,))
+    
+    # --- Decoder A: Reconstruct System Dynamics ---
+    x_s = layers.Dense(512, activation='tanh')(z_sys_in)
+    x_s = ResidualBlock(512)(x_s)
+    x_s = layers.Dense(output_steps * 128, activation='tanh')(x_s)
+    x_s = layers.Reshape((output_steps, 128))(x_s)
+    out_sys = layers.Conv1D(feat_sys, 1, padding='same')(x_s)
+    
+    # --- Decoder B: Reconstruct Residual/Sentinel ---
+    # This branch learns the "Silence" (0.0) of dead features 
+    # and the "Noise" of lone wolves.
+    x_r = layers.Dense(256, activation='tanh')(z_res_in)
+    x_r = layers.Dense(output_steps * feat_res, activation='tanh')(x_r)
+    out_res = layers.Reshape((output_steps, feat_res))(x_r)
+    
+    return models.Model([z_sys_in, z_res_in], [out_sys, out_res], name="DualDecoder")
 
 def build_discriminator(latent_dim=256):
     # Standard ACAE decomposition MLP [cite: 430, 436]

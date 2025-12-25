@@ -5,6 +5,7 @@ import os
 from scipy.signal import savgol_filter
 from .masking import get_masked_views
 from sklearn.cluster import AgglomerativeClustering
+from .router import route_features
 
 def load_txt_file(path):
     if not os.path.exists(path):
@@ -15,37 +16,7 @@ def load_txt_file(path):
         return np.loadtxt(path, dtype=np.float32)
 
 
-def preprocess_and_cluster(train_data, dist_threshold=0.5):
-    """
-    1. Removes constant (dead) features.
-    2. Clusters remaining features via correlation.
-    3. Purges lone-wolf features (clusters of size 1).
-    Returns cleaned training data, cluster labels, and surviving feature indices.
-    """
-    # 1. Identify active (non-constant) features
-    variances = np.var(train_data, axis=0)
-    active_feat_indices = np.where(variances > 1e-9)[0]
-    train_active = train_data[:, active_feat_indices]
 
-    # 2. Correlation-based grouping
-    corr = np.nan_to_num(np.corrcoef(train_active, rowvar=False))
-    dist = 1 - np.abs(corr)
-    
-    clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=dist_threshold, linkage='complete')
-    labels = clustering.fit_predict(dist)
-
-    # 3. Identify consensus-capable clusters (size > 1)
-    unique_ids, counts = np.unique(labels, return_counts=True)
-    multi_feature_ids = unique_ids[counts > 1]
-    
-    # Feature selector determines which COLUMNS to keep
-    feature_selector = np.isin(labels, multi_feature_ids)
-    
-    final_train_data = train_active[:, feature_selector]
-    final_cluster_labels = labels[feature_selector]
-    final_feature_indices = active_feat_indices[feature_selector]
-
-    return final_train_data, final_cluster_labels, final_feature_indices
 def calculate_physics_jerk(data, savgol_len=11, savgol_poly=3):
     """
     The Physics Branch: Converts raw telemetry into a 'Jerk Matrix'.
@@ -63,35 +34,32 @@ def calculate_physics_jerk(data, savgol_len=11, savgol_poly=3):
 
 def load_smd_windows(data_root, machine_id, window=64, train_stride=1):
     """
-    Updated Load Module: Creates 5 parallel window sets.
-    1. Main Normed Data
-    2. Jerk View 1 (T95)
-    3. Jerk View 2 (T90)
-    4. Jerk View 3 (T85)
-    5. Jerk View 4 (T80)
+    Dual-Anchor Loader: Routes features, masks consensus groups, 
+    and packs topology metadata into a structured return.
     """
+    print(f"🚀 Dual-Anchor Pipeline Initiated for {machine_id}")
+    
     # --- Step 1: Loading & Scaling ---
-    print(f"🚀 Processing {machine_id} with Global Jerk strategy...")
     train_path = os.path.join(data_root, "train", f"{machine_id}.txt")
     test_path = os.path.join(data_root, "test", f"{machine_id}.txt")
     label_path = os.path.join(data_root, "test_label", f"{machine_id}.txt")
 
-    train_raw = load_txt_file(train_path)
-    test_raw = load_txt_file(test_path)
-    test_labels = load_txt_file(label_path).flatten()
+    train_raw = np.loadtxt(train_path, delimiter=',', dtype=np.float32)
+    test_raw = np.loadtxt(test_path, delimiter=',', dtype=np.float32)
+    test_labels = np.loadtxt(label_path, delimiter=',', dtype=np.int32).flatten()
 
     scaler = StandardScaler()
-    train_norm = scaler.fit_transform(train_raw)
-    test_norm = scaler.transform(test_raw)
+    train_total_norm = scaler.fit_transform(train_raw)
+    test_total_norm = scaler.transform(test_raw)
 
-    # Removes constant features and groups others by correlation
-    train_norm, clusters, live_feat_idx= preprocess_and_cluster(train_norm)
-    test_norm_filtered = test_norm[:, live_feat_idx]
-
+    # --- Step 2: Physical Routing ---
+    # Now extracts the phy_labels required for the Consensus Masker Veto
+    (train_phy, train_res, test_phy, test_res), topo, phy_labels = route_features(
+        train_total_norm, test_total_norm
+    )
     
-    # --- Step 2: Global Branching ---
-    # We calculate the Jerk Matrix for the WHOLE sequence once.
-    train_jerk_matrix = calculate_physics_jerk(train_norm)
+    # --- Step 3: Physics & Windowing ---
+    train_jerk_matrix = calculate_physics_jerk(train_phy)
 
     def create_windows(data, stride):
         num_windows = (data.shape[0] - window) // stride + 1
@@ -100,53 +68,85 @@ def load_smd_windows(data_root, machine_id, window=64, train_stride=1):
             for i in range(num_windows)
         ], dtype=np.float32)
 
-    # Branch A: Main normalized windows
-    train_w_main = create_windows(train_norm, stride=train_stride)
-    # Branch B: Jerk windows for the masker
+    train_w_phy = create_windows(train_phy, stride=train_stride)
     train_jerk_w = create_windows(train_jerk_matrix, stride=train_stride)
+    train_res_w = create_windows(train_res, stride=train_stride)
 
-    # --- Step 3: Call Masker Module ---
-    # We'll define masker.py later, but we call it here to get our 4 tiers.
-    # It takes the jerk windows and outputs 4 binary masks.
-    v1, v2, v3, v4 = get_masked_views(train_w_main, train_jerk_w, clusters)
+    # --- Step 4: Consensus Masking ---
+    # This uses the phy_labels to ensure "Cluster-Wide Agreement"
+    v1, v2, v3, v4 = get_masked_views(train_w_phy, train_jerk_w, phy_labels)
 
-    # Pack the 5 parallel views together: (N, 5, window, features)
-    train_packed = np.stack([train_w_main, v1, v2, v3, v4, train_jerk_w], axis=1)
+    # --- Step 5: Packing Structural Returns ---
     
-    # Test remains standard (no masking needed for evaluation)
-    test_w = create_windows(test_norm_filtered, stride=window)
-    test_labels = test_labels[:test_w.shape[0] * window]
-
-    return train_packed, test_w, test_labels, scaler.mean_[live_feat_idx], scaler.scale_[live_feat_idx]
-
-def build_tf_datasets(train_w, test_w, val_split=0.2, batch_size=128):
-    """
-    Wraps the 5 parallel views into an optimized TF pipeline.
-    """
-    # Split Train into Train/Val
-    num_train = int(len(train_w) * (1 - val_split))
+    # train_final: [Views(Main+4Masks+Jerk), Residual_Data, Topology]
+    # Shape of phy_views: (N, 6, window, feat_phy)
+    phy_views = np.stack([train_w_phy, v1, v2, v3, v4, train_jerk_w], axis=1)
     
-    # Shuffle indices for random split
-    indices = np.arange(len(train_w))
+    train_final = {
+        "phy_views": phy_views,
+        "res_windows": train_res_w,
+        "topology": topo
+    }
+
+    # test_final: Standard windows for both anchors
+    test_w_phy = create_windows(test_phy, stride=window)
+    test_w_res = create_windows(test_res, stride=window)
+    
+    test_final = {
+        "phy": test_w_phy,
+        "res": test_w_res,
+        "topology": topo # Also include topo in test for the custom scorer
+    }
+
+    # Align labels with test windows
+    test_labels = test_labels[:test_w_phy.shape[0] * window]
+
+    # Return signature maintained (train, test, labels, mean, scale)
+    return train_final, test_final, test_labels, scaler.mean_, scaler.scale_
+
+def build_tf_datasets(train_final, test_final, val_split=0.2, batch_size=128):
+    """
+    Optimized TF pipeline for Dual-Anchor dictionaries.
+    Zips Phy Views and Res Windows into a single synchronized stream.
+    """
+    # 1. Extract Arrays from the Dictionary
+    phy_data = train_final['phy_views']   # (N, 6, 64, F_phy)
+    res_data = train_final['res_windows'] # (N, 64, F_res)
+    num_samples = len(phy_data)
+
+    # 2. Synchronized Train/Val Split
+    num_train = int(num_samples * (1 - val_split))
+    indices = np.arange(num_samples)
     np.random.shuffle(indices)
     
     train_idx = indices[:num_train]
     val_idx = indices[num_train:]
     
-    train_data = train_w[train_idx]
-    val_data = train_w[val_idx]
+    # 3. Data Shuffling and Slicing
+    train_phy, train_res = phy_data[train_idx], res_data[train_idx]
+    val_phy, val_res = phy_data[val_idx], res_data[val_idx]
+    
+    test_phy = test_final['phy']
+    test_res = test_final['res']
 
     AUTOTUNE = tf.data.AUTOTUNE
 
-    def make_dataset(data, shuffle=False):
-        # Slices (N, 5, 64, 38) -> yields (5, 64, 38)
-        ds = tf.data.Dataset.from_tensor_slices(data)
+    def make_dataset(phy, res, shuffle=False):
+        # Create separate datasets for each branch
+        ds_phy = tf.data.Dataset.from_tensor_slices(phy)
+        ds_res = tf.data.Dataset.from_tensor_slices(res)
+        
+        # Zip them so they yield (phy_batch, res_batch) together
+        ds = tf.data.Dataset.zip((ds_phy, ds_res))
+        
         if shuffle:
             ds = ds.cache().shuffle(2048)
+        
         return ds.batch(batch_size).prefetch(AUTOTUNE)
 
-    train_ds = make_dataset(train_data, shuffle=True)
-    val_ds = make_dataset(val_data, shuffle=False)
-    test_ds = make_dataset(test_w, shuffle=False)
+    # 4. Final Dataset Creation
+    train_ds = make_dataset(train_phy, train_res, shuffle=True)
+    val_ds = make_dataset(val_phy, val_res, shuffle=False)
+    test_ds = make_dataset(test_phy, test_res, shuffle=False)
 
     return train_ds, val_ds, test_ds
