@@ -19,12 +19,8 @@ def calculate_fleet_averages(file_path):
 
 # --- YOUR FILES ---
 files = {
-    "Random Masking, 1:1 with acae paper": "results/acae_randm_smd_results.csv",
-    "Univariate jerk + 50% veto multivariate + weighted loss": "results/acae_jerk_smd_weightedLoss.csv",
-    "Univariate jerk + 50% veto multivariate ": "results/acae_jerk_smd_results.csv",
-    "Univariate jerk + consensus mask + weighted loss": "results/acae_jerk_smd_consensusMask.csv",
-    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN": "results/acae_hnn_sobolev_consensus.csv",
-    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN + dual latent": "results/acae_hnn_sobolev_consensus_duaLatent.csv"
+
+    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN + dual latent": "results/final_acae_hnn_sobolev_consensus_duaLatent.csv"
 }
 
 print("--- GLOBAL FLEET AVERAGES (28 MACHINES) ---")

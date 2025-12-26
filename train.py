@@ -8,6 +8,7 @@ from sklearn.metrics import precision_recall_fscore_support
 from tensorflow.keras import backend as K
 import tensorflow as tf
 import multiprocessing as mp
+import traceback
 
 from src.trainer import DualAnchorACAETrainer
 from src.models import build_dual_encoder, build_dual_decoder, build_discriminator
@@ -20,37 +21,55 @@ def load_config(path):
 
 def get_best_metrics(scores, labels, step_size=100):
     """
-    Optimizes independently for Fc1 and PA%K AUC.
-    Returns only the best scores achieved for each.
+    Finds optimal thresholds for all evaluation philosophies.
+    Returns 6 values: fc1, pa_auc, f1_std, f1_pa, prec, rec.
     """
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels).astype(int)
     min_score, max_score = np.min(scores), np.max(scores)
     
     if min_score == max_score:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     thresholds = np.linspace(min_score, max_score, step_size)
     
     best_fc1 = 0.0
     best_pa_auc = 0.0
+    best_f1_std = 0.0      
+    best_f1_pa = 0.0       
+    best_prec_std = 0.0
+    best_recall_std = 0.0
+
+    from src.metrics import _point_adjustment_at_k, _f1_from_preds
 
     for thresh in thresholds:
         preds = (scores > thresh).astype(int)
         
-        # 1. Optimize for Fc1 (Event-wise Recall + Time-wise Precision)
-        # This is the actual metric reported in the paper 
+        # 1. Paper Specific Metrics (Strict)
         current_fc1 = compute_fc1(preds, labels)
         if current_fc1 > best_fc1:
             best_fc1 = current_fc1
             
-        # 2. Optimize for PA%K AUC (Integration of adjusted F1s)
-        # Calculated across K=0.0 to 1.0 per paper guidelines 
         current_pa_auc, _, _ = compute_pa_k_auc(scores, labels, base_threshold=thresh)
         if current_pa_auc > best_pa_auc:
             best_pa_auc = current_pa_auc
+            
+        # 2. Standard Point-wise (No Adjustment)
+        prec, rec, f1_std, _ = precision_recall_fscore_support(
+            labels, preds, average='binary', zero_division=0
+        )
+        if f1_std > best_f1_std:
+            best_f1_std = f1_std
+            best_prec_std = prec
+            best_recall_std = rec
 
-    return best_fc1, best_pa_auc
+        # 3. Classic SOTA Point-Adjusted (Generous)
+        adjusted_preds = _point_adjustment_at_k(preds, labels, K=0.0001) 
+        f1_pa = _f1_from_preds(adjusted_preds, labels)
+        if f1_pa > best_f1_pa:
+            best_f1_pa = f1_pa
+
+    return best_fc1, best_pa_auc, best_f1_std, best_f1_pa, best_prec_std, best_recall_std
 
 def train_on_machine(machine_id, config):
     print(f"\n🚀 K-SHIELD Engine Deployment: {machine_id}")
@@ -79,7 +98,7 @@ def train_on_machine(machine_id, config):
     decoder = build_dual_decoder(feat_sys=phy_dim, feat_res=res_dim)
     discriminator = build_discriminator(latent_dim=config["latent_dim"])
 
-    # 4. Trainer (Alpha VPO lives in the _train_step)
+    # 4. Trainer
     trainer = DualAnchorACAETrainer(
         encoder=encoder, decoder=decoder, discriminator=discriminator,
         config=config, topology=topo
@@ -95,28 +114,16 @@ def train_on_machine(machine_id, config):
     trainer.discriminator.save_weights(f"{save_path}/discriminator.weights.h5")
     print(f"💾 All 4 weights saved to {save_path}")
 
-    # 5. Balanced Anomaly Scoring
+    # 5. Scoring Logic
     recons = trainer.reconstruct(test_final)
-    
-    # --- Branch 1: Physics (HNN Path) ---
     e_p = np.mean(np.square(recons['phy_orig'] - recons['phy_hat']), axis=-1)
-    
-    # --- Branch 2: Residual (Lone Wolves) ---
     res_orig, res_hat = recons['res_orig'], recons['res_hat']
-    e_l = np.mean(np.square(
-        res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]
-    ), axis=-1)
-    
-    # --- Branch 3: Sentinel (Dead Sensors) ---
+    e_l = np.mean(np.square(res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]), axis=-1)
     e_d = np.mean(np.square(res_orig[:, :, topo.res_to_dead_local] - 0.0), axis=-1)
     
-    # --- THE KEY INNOVATION: MIN-MAX NORMALIZATION ---
-    # This prevents err_dead (the bully) from silencing the Physics branch
     def norm(s):
         return (s - np.min(s)) / (np.max(s) - np.min(s) + 1e-6)
 
-    # Combine normalized signals: Each branch now has an equal vote
-    # We still give Sentinel a slight nudge (2.0) because dead sensors are high-confidence
     score_p = norm(e_p)
     score_l = norm(e_l)
     score_d = norm(e_d)
@@ -124,19 +131,44 @@ def train_on_machine(machine_id, config):
     combined_window_scores = score_p + score_l + (1.0 * score_d)
     point_scores = combined_window_scores.flatten() 
 
-    # 6. Alignment & Metric Optimization
+    # 6. Metric Optimization
     min_len = min(len(point_scores), len(test_labels))
     point_scores, test_labels = point_scores[:min_len], test_labels[:min_len]
 
-    fc1_score, pa_auc_score = get_best_metrics(point_scores, test_labels)
+    fc1, pa_auc, f1_std, f1_pa, prec, rec = get_best_metrics(point_scores, test_labels)
     auc_score = compute_auc(point_scores, test_labels)
 
-    print(f"✅ {machine_id} -> AUC: {auc_score:.4f} | Fc1: {fc1_score:.4f} | PA%K: {pa_auc_score:.4f}")
+    print(f"\n📊 {machine_id} Evaluation Report:")
+    print(f"   [Paper Strict ] Fc1: {fc1:.4f} | PA%K AUC: {pa_auc:.4f} | AUC: {auc_score:.4f}")
+    print(f"   [Classic SOTA] F1-PA: {f1_pa:.4f} (Generous)")
+    print(f"   [Standard PW ] F1: {f1_std:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f}")
 
     K.clear_session()
     gc.collect()
 
-    return auc_score, fc1_score, pa_auc_score
+    return auc_score, fc1, pa_auc, f1_std, f1_pa, prec, rec
+
+def worker_task(mid, config, csv_path):
+    """Child process executor with clean TF initialization."""
+    try:
+        # GPU Setup
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+
+        # Run Training & Scoring
+        auc, fc1, pa_auc, f1_std, f1_pa, prec, rec = train_on_machine(mid, config)
+        
+        # Save to CSV
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([mid, auc, fc1, pa_auc, f1_std, f1_pa, prec, rec])
+            
+    except Exception as e:
+        print(f"❌ Failed on {mid}: {e}")
+        traceback.print_exc()
+
 def run_all_machines(config):
     machine_ids = [
         "machine-1-1", "machine-1-2", "machine-1-3", "machine-1-4", 
@@ -149,44 +181,43 @@ def run_all_machines(config):
     ]
     
     os.makedirs("results", exist_ok=True)
-    csv_path = "results/acae_hnn_sobolev_consensus_duaLatent.csv"
+    csv_path = "results/final_acae_hnn_sobolev_consensus_duaLatent.csv"
 
     if not os.path.isfile(csv_path):
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["machine_id", "auc", "fc1", "pa_k_auc"])
+            writer.writerow(["machine_id", "auc", "fc1", "pa_k_auc", "f1_std", "f1_pa", "precision", "recall"])
 
+    # Sequential execution via individual processes for maximum GPU memory safety
     for mid in machine_ids:
         p = mp.Process(target=worker_task, args=(mid, config, csv_path))
         p.start()
         p.join() 
 
-def worker_task(mid, config, csv_path):
+def main():
+    # Set the multiprocessing start method globally before any TF imports
     try:
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
-        auc, fc1, pa_auc = train_on_machine(mid, config)
-        
-        with open(csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([mid, auc, fc1, pa_auc])
-            
-    except Exception as e:
-        print(f"❌ Failed on {mid}: {e}")
-
-def main(config_path, run_all=False):
-    config = load_config(config_path)
-    if run_all:
-        run_all_machines(config)
-    else:
-        mid = "machine-1-1"
-        train_on_machine(mid, config)
-
-if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
-    main(args.config, run_all=args.all)
+
+    config = load_config(args.config)
+    
+    if args.all:
+        run_all_machines(config)
+    else:
+        # Single machine test run
+        mid = "machine-1-1"
+        # We still use a separate process even for one machine to maintain isolation
+        csv_path = "results/single_machine_test.csv"
+        p = mp.Process(target=worker_task, args=(mid, config, csv_path))
+        p.start()
+        p.join()
+
+if __name__ == "__main__":
+    main()
