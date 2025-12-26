@@ -1,7 +1,7 @@
 # Model Hyperparameters
 latent_dim: 256        # Dimension of the latent vector z
 batch_size: 128        # Batch size for training 
-lr: 0.0001             # Learning rate for Adam optimizer 
+lr: 0.00010             # Learning rate for Adam optimizer 
 
 # --- NEW: Hamiltonian Physics Parameters ---
 # These control the Leapfrog Integration (dq/dt, dp/dt)
@@ -16,8 +16,7 @@ recon_weight: 1.0      # Weight for Reconstruction loss
 lambda_mom: 0.5
 
 # Weighted Loss Parameters (Physics-Informed)
-alpha_vpo: 10.0        # High penalty for high-jerk (momentum) anomalies
+alpha_vpo: 150.0        # High penalty for high-jerk (momentum) anomalies
 
 # Training Loop
-epochs: 200            # Standard max epochs [cite: 545]
-patience: 15            # Early stopping patience if val_recon stalls 
+epochs: 200            # Standard max epochs 

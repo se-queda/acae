@@ -117,7 +117,7 @@ class DualAnchorACAETrainer:
             Each batch is a tuple: (phy_batch, res_batch)
             """
             best_val_loss = float("inf")
-            patience = 10  # Increased slightly for stability
+            patience = 15  # Increased slightly for stability
             wait = 0 
             
             for epoch in range(epochs):
@@ -169,21 +169,22 @@ class DualAnchorACAETrainer:
                             break
                     
     def reconstruct(self, test_final):
-            # 1. Unpack 4D Physics Views: (N, 6, 64, feat)
-            # We use 'phy_views' if that's what's in the dict, or 'phy'
-            phy_views = tf.cast(test_final['phy_views'], tf.float32) 
-            res_data  = tf.cast(test_final['res_windows'], tf.float32)
+            # Unpack from test_final (standardizing on 'phy' and 'res' keys)
+            phy_views = tf.cast(test_final['phy'], tf.float32) 
+            res_data  = tf.cast(test_final['res'], tf.float32)
             
-            # 2. Extract the Anchor (View 0) for the forward pass
-            phy_anchor = phy_views[:, 0, :, :] 
-            
-            # 3. Forward Pass
+            # Slicing: If test_phy is 4D (N, 6, 64, F), take view 0.
+            # If it's already 3D (N, 64, F), it stays as is.
+            if len(phy_views.shape) == 4:
+                phy_anchor = phy_views[:, 0, :, :]
+            else:
+                phy_anchor = phy_views
+
             z_sys, z_res, _ = self.encoder([phy_anchor, res_data], training=False)
             recons_phy, recons_res = self.decoder([z_sys, z_res], training=False)
             
-            # 4. Return everything needed for the Alpha VPO score
             return {
-                "phy_orig": phy_views.numpy(), # Keep all 6 views for index-5 Jerk access
+                "phy_orig": phy_anchor.numpy(), # 3D only for the scorer
                 "phy_hat": recons_phy.numpy(),
                 "res_orig": res_data.numpy(),
                 "res_hat": recons_res.numpy()

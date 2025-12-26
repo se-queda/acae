@@ -55,7 +55,7 @@ def get_best_metrics(scores, labels, step_size=100):
 def train_on_machine(machine_id, config):
     print(f"\n🚀 K-SHIELD Engine Deployment: {machine_id}")
 
-    # 1. Load & Build (Already includes Index-5 Jerk view)
+    # 1. Load Data
     train_final, test_final, test_labels, _, _ = load_smd_windows(
         data_root=config.get("data_root", "/home/utsab/Downloads/smd/ServerMachineDataset"),
         machine_id=machine_id,
@@ -67,17 +67,19 @@ def train_on_machine(machine_id, config):
     phy_dim = len(topo.idx_phy)
     res_dim = len(topo.idx_res)
 
+    # 2. Build Datasets
     train_ds, val_ds, test_ds = build_tf_datasets(
         train_final, test_final, 
         val_split=0.2, 
         batch_size=config["batch_size"]
     )
 
-    # 2. Build & Train
+    # 3. Build Models
     encoder = build_dual_encoder(input_shape_sys=(64, phy_dim), input_shape_res=(64, res_dim))
     decoder = build_dual_decoder(feat_sys=phy_dim, feat_res=res_dim)
     discriminator = build_discriminator(latent_dim=config["latent_dim"])
 
+    # 4. Trainer (Alpha VPO lives in the _train_step)
     trainer = DualAnchorACAETrainer(
         encoder=encoder, decoder=decoder, discriminator=discriminator,
         config=config, topology=topo
@@ -85,41 +87,36 @@ def train_on_machine(machine_id, config):
     
     trainer.fit(train_ds, val_ds=val_ds, epochs=config["epochs"])
 
-    # 3. Gated Anomaly Scoring (INFERENCE)
+    # 5. Balanced Anomaly Scoring
     recons = trainer.reconstruct(test_final)
     
-    # --- 3a. Extract Jerk from View-5 ---
-    # recons['phy_orig'] is actually the full views tensor: (N, 6, 64, phy_dim)
-    # View 0: Original Anchor
-    # View 5: Kinematic Hyper-Gradient (Jerk)
-    phy_anchor = recons['phy_orig'][:, 0, :, :]
-    phy_jerk   = recons['phy_orig'][:, 5, :, :] # This is the 'train_jerk_w' we packed
+    # --- Branch 1: Physics (HNN Path) ---
+    e_p = np.mean(np.square(recons['phy_orig'] - recons['phy_hat']), axis=-1)
     
-    # Define VPO weights based on the packed jerk
-    j_thresh = np.mean(phy_jerk) + np.std(phy_jerk)
-    vpo_weights = np.where(phy_jerk > j_thresh, config.get("alpha_vpo", 10.0), 1.0)
-
-    # --- 3b. Weighted Reconstruction Error ---
-    # Applying Alpha_VPO to the HNN path where Jerk is high
-    err_phy = np.mean(np.square(phy_anchor - recons['phy_hat']) * vpo_weights, axis=-1)
-    
-    # Residual breakdown
+    # --- Branch 2: Residual (Lone Wolves) ---
     res_orig, res_hat = recons['res_orig'], recons['res_hat']
-    err_lone = np.mean(np.square(res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]), axis=-1)
-    err_dead = np.mean(np.square(res_orig[:, :, topo.res_to_dead_local] - 0.0), axis=-1)
-
-    # --- 3c. Normalized SOTA Fusion ---
-    def normalize_score(s):
+    e_l = np.mean(np.square(
+        res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]
+    ), axis=-1)
+    
+    # --- Branch 3: Sentinel (Dead Sensors) ---
+    e_d = np.mean(np.square(res_orig[:, :, topo.res_to_dead_local] - 0.0), axis=-1)
+    
+    # --- THE KEY INNOVATION: MIN-MAX NORMALIZATION ---
+    # This prevents err_dead (the bully) from silencing the Physics branch
+    def norm(s):
         return (s - np.min(s)) / (np.max(s) - np.min(s) + 1e-6)
 
-    # Combining the Physics (with VPO) and the Sentinel Guard
-    score_phy = normalize_score(err_phy)
-    score_res = normalize_score(err_lone + (10.0 * err_dead)) 
+    # Combine normalized signals: Each branch now has an equal vote
+    # We still give Sentinel a slight nudge (2.0) because dead sensors are high-confidence
+    score_p = norm(e_p)
+    score_l = norm(e_l)
+    score_d = norm(e_d)
     
-    combined_window_scores = score_phy + score_res
+    combined_window_scores = score_p + score_l + (1.0 * score_d)
     point_scores = combined_window_scores.flatten() 
 
-    # 4. Metric Optimization
+    # 6. Alignment & Metric Optimization
     min_len = min(len(point_scores), len(test_labels))
     point_scores, test_labels = point_scores[:min_len], test_labels[:min_len]
 
@@ -132,7 +129,6 @@ def train_on_machine(machine_id, config):
     gc.collect()
 
     return auc_score, fc1_score, pa_auc_score
-
 def run_all_machines(config):
     machine_ids = [
         "machine-1-1", "machine-1-2", "machine-1-3", "machine-1-4", 
