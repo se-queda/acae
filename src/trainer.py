@@ -150,12 +150,9 @@ class DualAnchorACAETrainer:
                         z_s, z_r, _ = self.encoder([v_phy_anchor, v_res], training=False)
                         h_phy, h_res = self.decoder([z_s, z_r], training=False)
                         
-# FIX: Calculate MSE for each branch separately, THEN add the scalars
-                    mse_phy = tf.reduce_mean(tf.square(v_phy_anchor - h_phy))
-                    mse_res = tf.reduce_mean(tf.square(v_res - h_res))
-                    
-                    # Now they are both scalars, adding them is safe
-                    val_losses.append((mse_phy + mse_res).numpy())
+                        mse_phy = tf.reduce_mean(tf.square(v_phy_anchor - h_phy))
+                        mse_res = tf.reduce_mean(tf.square(v_res - h_res))
+                        val_losses.append((mse_phy + mse_res).numpy())
                     
                     current_val_loss = float(np.mean(val_losses))
                     print(f"✅ Val Total Recon (MSE): {current_val_loss:.4f}")

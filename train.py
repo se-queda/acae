@@ -86,6 +86,14 @@ def train_on_machine(machine_id, config):
     )
     
     trainer.fit(train_ds, val_ds=val_ds, epochs=config["epochs"])
+    
+    save_path = f"results/weights/{machine_id}"
+    os.makedirs(save_path, exist_ok=True)
+    
+    trainer.encoder.save_weights(f"{save_path}/encoder.weights.h5")
+    trainer.decoder.save_weights(f"{save_path}/decoder.weights.h5")
+    trainer.discriminator.save_weights(f"{save_path}/discriminator.weights.h5")
+    print(f"💾 All 4 weights saved to {save_path}")
 
     # 5. Balanced Anomaly Scoring
     recons = trainer.reconstruct(test_final)
