@@ -21,8 +21,7 @@ def load_config(path):
 
 def get_best_metrics(scores, labels, step_size=100):
     """
-    Finds optimal thresholds for all evaluation philosophies.
-    Returns 6 values: fc1, pa_auc, f1_std, f1_pa, prec, rec.
+    Finds optimal thresholds for all evaluation philosophies. [cite: 489, 516]
     """
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels).astype(int)
@@ -45,7 +44,7 @@ def get_best_metrics(scores, labels, step_size=100):
     for thresh in thresholds:
         preds = (scores > thresh).astype(int)
         
-        # 1. Paper Specific Metrics (Strict)
+        # 1. Paper Specific Metrics (Strict) [cite: 511, 514]
         current_fc1 = compute_fc1(preds, labels)
         if current_fc1 > best_fc1:
             best_fc1 = current_fc1
@@ -63,7 +62,7 @@ def get_best_metrics(scores, labels, step_size=100):
             best_prec_std = prec
             best_recall_std = rec
 
-        # 3. Classic SOTA Point-Adjusted (Generous)
+        # 3. Classic SOTA Point-Adjusted (Generous) [cite: 515]
         adjusted_preds = _point_adjustment_at_k(preds, labels, K=0.0001) 
         f1_pa = _f1_from_preds(adjusted_preds, labels)
         if f1_pa > best_f1_pa:
@@ -72,39 +71,57 @@ def get_best_metrics(scores, labels, step_size=100):
     return best_fc1, best_pa_auc, best_f1_std, best_f1_pa, best_prec_std, best_recall_std
 
 def train_on_machine(machine_id, config):
-    print(f"\n🚀 K-SHIELD Engine Deployment: {machine_id}")
+    print(f"\n🚀 Dual-Anchor Engine Deployment: {machine_id}")
 
-    # 1. Load Data
+    # --- Structural Initialization from YAML ---
+    W = config["window_size"]  # [cite: 544, 580]
+    S = config["stride"]       # [cite: 544, 577]
+    BS = config["batch_size"]  # 
+    VS = config["val_split"]   # 
+    EP = config["epochs"]      # 
+    L = config["latent_dim"]   # [cite: 543]
+
+    # 1. Load Data (Dynamic Dimensions)
     train_final, test_final, test_labels, _, _ = load_smd_windows(
         data_root=config.get("data_root", "/home/utsab/Downloads/smd/ServerMachineDataset"),
         machine_id=machine_id,
-        window=64,
-        train_stride=config.get("stride", 1)
+        config=config # Pass whole config for savgol/sparsity params
     )
     
     topo = train_final['topology']
     phy_dim = len(topo.idx_phy)
     res_dim = len(topo.idx_res)
 
-    # 2. Build Datasets
+    # 2. Build Datasets using config BS and VS
     train_ds, val_ds, test_ds = build_tf_datasets(
         train_final, test_final, 
-        val_split=0.2, 
-        batch_size=config["batch_size"]
+        val_split=VS, 
+        batch_size=BS
     )
 
-    # 3. Build Models
-    encoder = build_dual_encoder(input_shape_sys=(64, phy_dim), input_shape_res=(64, res_dim))
-    decoder = build_dual_decoder(feat_sys=phy_dim, feat_res=res_dim)
-    discriminator = build_discriminator(latent_dim=config["latent_dim"])
+    # 3. Build Models using config L and h_dim
+    encoder = build_dual_encoder(
+        input_shape_sys=(W, phy_dim), 
+        input_shape_res=(W, res_dim), 
+        config=config
+    )
+    decoder = build_dual_decoder(
+        feat_sys=phy_dim, 
+        feat_res=res_dim, 
+        output_steps=W, 
+        config=config
+    )
+    
+    # Discriminator: Anchor (L) + Candidate (L) = L*2 
+    discriminator = build_discriminator(input_dim=L * 2)
 
-    # 4. Trainer
+    # 4. Trainer Initialization (Loss weights λ1, λ2, and alpha_vpo) [cite: 475]
     trainer = DualAnchorACAETrainer(
         encoder=encoder, decoder=decoder, discriminator=discriminator,
         config=config, topology=topo
     )
     
-    trainer.fit(train_ds, val_ds=val_ds, epochs=config["epochs"])
+    trainer.fit(train_ds, val_ds=val_ds, epochs=EP)
     
     save_path = f"results/weights/{machine_id}"
     os.makedirs(save_path, exist_ok=True)
@@ -112,42 +129,42 @@ def train_on_machine(machine_id, config):
     trainer.encoder.save_weights(f"{save_path}/encoder.weights.h5")
     trainer.decoder.save_weights(f"{save_path}/decoder.weights.h5")
     trainer.discriminator.save_weights(f"{save_path}/discriminator.weights.h5")
-    print(f"💾 All 4 weights saved to {save_path}")
 
-    # 5. Scoring Logic
+    # 5. Scoring Logic (Point-wise Error calculation) [cite: 485, 486]
     recons = trainer.reconstruct(test_final)
+
+    # Physics Branch Error (with configured alpha_vpo)
     e_p = np.mean(np.square(recons['phy_orig'] - recons['phy_hat']), axis=-1)
     res_orig, res_hat = recons['res_orig'], recons['res_hat']
+
+    # Lone Wolf vs Sentinel specific errors
     e_l = np.mean(np.square(res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]), axis=-1)
     e_d = np.mean(np.square(res_orig[:, :, topo.res_to_dead_local] - 0.0), axis=-1)
-    
+
     def norm(s):
         return (s - np.min(s)) / (np.max(s) - np.min(s) + 1e-6)
 
-    score_p = norm(e_p)
-    score_l = norm(e_l)
-    score_d = norm(e_d)
-    
-    combined_window_scores = score_p + score_l + (1.0 * score_d)
-    point_scores = combined_window_scores.flatten() 
+    score_p, score_l, score_d = norm(e_p), norm(e_l), norm(e_d)
+    point_scores = (score_p + score_l + score_d).flatten()
 
-    # 6. Metric Optimization
+
+    # 6. Metrics and Thresholding [cite: 509, 511, 514]
     min_len = min(len(point_scores), len(test_labels))
     point_scores, test_labels = point_scores[:min_len], test_labels[:min_len]
+
 
     fc1, pa_auc, f1_std, f1_pa, prec, rec = get_best_metrics(point_scores, test_labels)
     auc_score = compute_auc(point_scores, test_labels)
 
-    print(f"\n📊 {machine_id} Evaluation Report:")
-    print(f"   [Paper Strict ] Fc1: {fc1:.4f} | PA%K AUC: {pa_auc:.4f} | AUC: {auc_score:.4f}")
-    print(f"   [Classic SOTA] F1-PA: {f1_pa:.4f} (Generous)")
-    print(f"   [Standard PW ] F1: {f1_std:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f}")
 
     K.clear_session()
     gc.collect()
 
+
     return auc_score, fc1, pa_auc, f1_std, f1_pa, prec, rec
 
+
+ 
 def worker_task(mid, config, csv_path):
     """Child process executor with clean TF initialization."""
     try:
@@ -171,17 +188,12 @@ def worker_task(mid, config, csv_path):
 
 def run_all_machines(config):
     machine_ids = [
-        "machine-1-1", "machine-1-2", "machine-1-3", "machine-1-4", 
-        "machine-1-5", "machine-1-6", "machine-1-7", "machine-1-8",
-        "machine-2-1", "machine-2-2", "machine-2-3", "machine-2-4", 
-        "machine-2-5", "machine-2-6", "machine-2-7", "machine-2-8", "machine-2-9",
-        "machine-3-1", "machine-3-2", "machine-3-3", "machine-3-4", 
-        "machine-3-5", "machine-3-6", "machine-3-7", "machine-3-8", 
+        "machine-3-6", "machine-3-7", "machine-3-8", 
         "machine-3-9", "machine-3-10", "machine-3-11"
     ]
     
     os.makedirs("results", exist_ok=True)
-    csv_path = "results/final_acae_hnn_sobolev_consensus_duaLatent.csv"
+    csv_path = "results/acae_hnn_sobolev_TCN_consensus_duaLatent.csv"
 
     if not os.path.isfile(csv_path):
         with open(csv_path, "w", newline="") as f:
@@ -212,7 +224,7 @@ def main():
         run_all_machines(config)
     else:
         # Single machine test run
-        mid = "machine-1-1"
+        mid = "machine-2-1"
         # We still use a separate process even for one machine to maintain isolation
         csv_path = "results/single_machine_test.csv"
         p = mp.Process(target=worker_task, args=(mid, config, csv_path))

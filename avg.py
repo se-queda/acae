@@ -19,8 +19,10 @@ def calculate_fleet_averages(file_path):
 
 # --- YOUR FILES ---
 files = {
-
-    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN + dual latent": "results/final_acae_hnn_sobolev_consensus_duaLatent.csv"
+    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN": "results/acae_hnn_sobolev_consensus.csv",
+    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN +mlp + dual latent": "results/final_acae_hnn_sobolev_consensus_duaLatent.csv",
+    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN + TCN+ dual latent": "results/acae_hnn_sobolev_TCN_consensus_duaLatent.csv",
+    
 }
 
 print("--- GLOBAL FLEET AVERAGES (28 MACHINES) ---")

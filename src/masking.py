@@ -59,6 +59,7 @@ def univariate_masker(data_windows, jerk_windows):
     return views[0], views[1], views[2], views[3]
 
 
+
 def consensus_masker(data_windows, jerk_windows, cluster_labels):
     """
     The Final Algorithm:
@@ -112,3 +113,48 @@ def consensus_masker(data_windows, jerk_windows, cluster_labels):
 
 # Point the main entry point to the new consensus logic
 get_masked_views = consensus_masker
+
+
+
+def resi_masker(data_windows, jerk_windows, p_tile=90):
+    """
+    Lone Wolf Specialist Masker:
+    Uses a single high-sensitivity tier (default 90th percentile)
+    to shred data windows where envelope jerk is peaking.
+    """
+    N, T, F = data_windows.shape
+    
+    # budgets[feature_idx] stores K (how many windows to mask)
+    budgets = np.zeros(F, dtype=int)
+    # sorted_indices[feature_idx] stores window indices sorted by jerk mean
+    sorted_indices = np.zeros((F, N), dtype=int)
+
+    # --- Step 1: Physical Budgeting ---
+    for f in range(F):
+        feat_jerk_wins = jerk_windows[:, :, f]
+        flat_jerk = feat_jerk_wins.flatten()
+        
+        # Calculate the specific 90th percentile threshold
+        threshold = np.percentile(flat_jerk, p_tile)
+        
+        count_above = np.sum(flat_jerk > threshold)
+        # Calculate budget K: How many windows-worth of samples are unstable?
+        k = int(np.ceil(count_above / T))
+        
+        if count_above > 0 and k == 0: k = 1
+        budgets[f] = k
+            
+        # Score windows by mean jerk
+        window_means = np.mean(feat_jerk_wins, axis=1)
+        sorted_indices[f] = np.argsort(window_means)
+
+    # --- Step 2: Apply Veto Masking ---
+    masked_view = data_windows.copy()
+    for f in range(F):
+        k = budgets[f]
+        if k > 0:
+            # Shred the top K jerkiest windows
+            top_k_idx = sorted_indices[f][-k:]
+            masked_view[top_k_idx, :, f] = 0.0
+
+    return masked_view

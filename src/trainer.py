@@ -4,29 +4,30 @@ import numpy as np
 from .losses import encoder_loss, discriminator_loss
 from .masking import mix_features
 
+# Preferred persona namespace
 namespace = tf.keras
 
 class DualAnchorACAETrainer:
     def __init__(self, encoder, decoder, discriminator, config, topology):
-        """
-        encoder: DualHeadEncoder outputting [z_sys, z_res, z_combined]
-        decoder: DualHeadDecoder outputting [out_sys, out_res]
-        """
         self.encoder = encoder
         self.decoder = decoder
         self.discriminator = discriminator
-        self.topo = topology # MachineTopology object from router.py
+        self.topo = topology 
 
-        # Hyperparameters
-        self.latent_dim = config.get("latent_dim", 256) 
-        self.lr = config.get("lr", 1e-4)
+        # Hyperparameters from Config
+        self.latent_dim = config["latent_dim"]
+        self.lr = config["lr"]
         
-        # Loss Weights
-        self.lambda_d = config.get("lambda_d", 1.0)
-        self.lambda_e = config.get("lambda_e", 1.0)
-        self.recon_weight = config.get("recon_weight", 1.0)
-        self.alpha_vpo = config.get("alpha_vpo", 10.0) # Physics weighting
-        self.sentinel_weight = config.get("sentinel_weight", 5.0) # Dead feature weighting
+        # Loss Weights from Config
+        self.lambda_d = config["lambda_d"]
+        self.lambda_e = config["lambda_e"]
+        self.recon_weight = config["recon_weight"]
+        self.alpha_vpo = config["alpha_vpo"]
+        self.sentinel_weight = config["sentinel_weight"]
+        
+        # Training Control
+        self.patience = config["patience"]
+        self.batch_size = config["batch_size"]
 
         # Optimizers
         self.enc_dec_optimizer = namespace.optimizers.Adam(learning_rate=self.lr, clipnorm=1.0)
@@ -39,60 +40,47 @@ class DualAnchorACAETrainer:
 
     @tf.function
     def _train_step(self, phy_packed, res_windows):
-        """
-        phy_packed: (N, 6, 64, F_phy) - Views for Hamiltonian Branch
-        res_windows: (N, 64, F_res)  - Windows for Residual Branch
-        """
-        # Unpack Physics Views
+        # 1. Unpack Physics Views
         anchor_phy = phy_packed[:, 0, :, :]        
         aug_views_phy = phy_packed[:, 1:5, :, :] 
         jerk_phy = phy_packed[:, 5, :, :] 
         
         with tf.GradientTape(persistent=True) as tape:
-            # 1. FORWARD PASS: Dual-Anchor Inference
+            # 2. Forward Pass
             z_sys, z_res, z_comb = self.encoder([anchor_phy, res_windows], training=True)
             recons_phy, recons_res = self.decoder([z_sys, z_res], training=True)
             
-            # 2. PHYSICS LOSS (Hamiltonian Branch)
+            # 3. Physics Loss (Hamiltonian Branch)
             j_abs = tf.abs(jerk_phy)
             j_thresh = tf.reduce_mean(j_abs) + tf.math.reduce_std(j_abs)
             vpo_weights = tf.where(j_abs > j_thresh, self.alpha_vpo, 1.0)
             recon_phy_loss = tf.reduce_mean(tf.square(anchor_phy - recons_phy) * vpo_weights)
             
-            # 3. RESIDUAL & SENTINEL LOSS (Identity Branch)
+            # 4. Residual & Sentinel Loss
             recon_res_loss = tf.reduce_mean(tf.square(res_windows - recons_res))
-            
-            # THE SENTINEL BAKE: Force dead features (via topo local indices) to absolute zero
             dead_recons = tf.gather(recons_res, self.topo.res_to_dead_local, axis=-1)
             sentinel_loss = tf.reduce_mean(tf.square(dead_recons - 0.0))
             
             total_recon_loss = recon_phy_loss + recon_res_loss + (self.sentinel_weight * sentinel_loss)
 
-            # 4. UPGRADED JOINT-MANIFOLD ADVERSARIAL TASK
+            # 5. Joint-Manifold Adversarial Task
             z_pos_all, alpha_all = [], []
             for i in range(4):
                 view_phy = aug_views_phy[:, i, :, :]
-                # Challenge the physics head while keeping the residual head stable
                 z_s_aug, _, _ = self.encoder([view_phy, res_windows], training=True)
-                
-                # MIXING UPGRADE: Interpolate ONLY the physics latent
-                # This ensures the HNN learns to hallucinate physics within a stable machine context
                 z_mixed, alpha = mix_features(z_sys, z_s_aug)
-                
-                # Reconstruct the mixed Joint Latent [Mixed_Sys, Original_Res]
                 z_mixed_comb = tf.concat([z_mixed, z_res], axis=-1)
+                z_pair = tf.concat([z_comb, z_mixed_comb], axis=1) 
                 
-                z_pos_all.append(tf.concat([z_comb, z_mixed_comb], axis=1))
+                z_pos_all.append(z_pair)
                 alpha_all.append(alpha)
 
             z_mixed_pos = tf.concat(z_pos_all, axis=0)
             alpha_pos = tf.concat(alpha_all, axis=0)
             
-            # Negative Pair: Mix anchor with a shuffled version of itself
             z_neg_mixed, beta_neg = mix_features(z_comb, tf.random.shuffle(z_comb))
-            z_neg_pair = tf.concat([z_comb, z_neg_mixed], axis=1)
+            z_neg_pair = tf.concat([z_comb, z_neg_mixed], axis=1) 
 
-            # Discriminator judging the "Purity" of the joint state
             d_out_pos = self.discriminator(z_mixed_pos, training=True)
             d_out_neg = self.discriminator(z_neg_pair, training=True)
 
@@ -112,77 +100,79 @@ class DualAnchorACAETrainer:
         return total_recon_loss, loss_disc, loss_enc
 
     def fit(self, train_ds, val_ds=None, epochs=200):
-            """
-            Accepts pre-built datasets from build_tf_datasets.
-            Each batch is a tuple: (phy_batch, res_batch)
-            """
-            best_val_loss = float("inf")
-            patience = 15  # Increased slightly for stability
-            wait = 0 
+        best_val_loss = float("inf")
+        wait = 0 
+        
+        for epoch in range(epochs):
+            self.recon_metric.reset_state()
+            self.disc_metric.reset_state()
+            self.enc_metric.reset_state()
             
-            for epoch in range(epochs):
-                self.recon_metric.reset_state()
-                self.disc_metric.reset_state()
-                self.enc_metric.reset_state()
+            bar = tqdm(train_ds, desc=f"Epoch {epoch+1}", unit="batch")
+            for phy_batch, res_batch in bar:
+                r_loss, d_loss, e_loss = self._train_step(phy_batch, res_batch)
+                self.recon_metric.update_state(r_loss)
+                self.disc_metric.update_state(d_loss)
+                self.enc_metric.update_state(e_loss)
                 
-                # Use tqdm bar over the dataset
-                bar = tqdm(train_ds, desc=f"Epoch {epoch+1}", unit="batch")
-                for phy_batch, res_batch in bar:
-                    r_loss, d_loss, e_loss = self._train_step(phy_batch, res_batch)
-                    
-                    self.recon_metric.update_state(r_loss)
-                    self.disc_metric.update_state(d_loss)
-                    self.enc_metric.update_state(e_loss)
-                    
-                    bar.set_postfix({
-                        "Recon": f"{r_loss:.4f}", 
-                        "Disc": f"{d_loss:.4f}",
-                        "Enc": f"{e_loss:.4f}"
-                    })
+                bar.set_postfix({"Recon": f"{r_loss:.4f}", "Disc": f"{d_loss:.4f}"})
 
-                # Validation logic using the zipped val_ds
-                if val_ds is not None:
-                    val_losses = []
-                    for v_phy, v_res in val_ds:
-                        # Logic to calculate val_recon across both branches
-                        # We only care about the first view (index 0) of v_phy for validation
-                        v_phy_anchor = v_phy[:, 0, :, :] 
-                        z_s, z_r, _ = self.encoder([v_phy_anchor, v_res], training=False)
-                        h_phy, h_res = self.decoder([z_s, z_r], training=False)
-                        
-                        mse_phy = tf.reduce_mean(tf.square(v_phy_anchor - h_phy))
-                        mse_res = tf.reduce_mean(tf.square(v_res - h_res))
-                        val_losses.append((mse_phy + mse_res).numpy())
+            if val_ds is not None:
+                val_losses = []
+                for v_phy, v_res in val_ds:
+                    # 1. Forward Pass (No training)
+                    v_phy_anchor = v_phy[:, 0, :, :] 
+                    z_s, z_r, _ = self.encoder([v_phy_anchor, v_res], training=False)
+                    h_phy, h_res = self.decoder([z_s, z_r], training=False)
                     
-                    current_val_loss = float(np.mean(val_losses))
-                    print(f"✅ Val Total Recon (MSE): {current_val_loss:.4f}")
+                    # 2. FIXED: Calculate MSE for each branch separately to avoid shape broadcast errors
+                    mse_phy = tf.reduce_mean(tf.square(v_phy_anchor - h_phy))
+                    mse_res = tf.reduce_mean(tf.square(v_res - h_res))
                     
-                    if current_val_loss < best_val_loss:
-                        best_val_loss, wait = current_val_loss, 0
-                    else:
-                        wait += 1
-                        if wait >= patience:
-                            print(f"🛑 Early stopping at epoch {epoch+1}")
-                            break
+                    # 3. Add the scalars together
+                    val_losses.append((mse_phy + mse_res).numpy())
+                
+                current_val_loss = float(np.mean(val_losses))
+                print(f"✅ Val MSE: {current_val_loss:.4f} | Best: {best_val_loss:.4f}")
+                
+                if current_val_loss < best_val_loss:
+                    best_val_loss, wait = current_val_loss, 0
+                else:
+                    wait += 1
+                    if wait >= self.patience:
+                        print(f"🛑 Early stopping at epoch {epoch+1}")
+                        break
                     
-    def reconstruct(self, test_final):
-            # Unpack from test_final (standardizing on 'phy' and 'res' keys)
-            phy_views = tf.cast(test_final['phy'], tf.float32) 
-            res_data  = tf.cast(test_final['res'], tf.float32)
-            
-            # Slicing: If test_phy is 4D (N, 6, 64, F), take view 0.
-            # If it's already 3D (N, 64, F), it stays as is.
-            if len(phy_views.shape) == 4:
-                phy_anchor = phy_views[:, 0, :, :]
-            else:
-                phy_anchor = phy_views
+    def reconstruct(self, test_final, batch_size=128):
+        print("🔍 Generating Point-wise Reconstructions...")
+        phy_views = tf.cast(test_final['phy'], tf.float32) 
+        res_data  = tf.cast(test_final['res'], tf.float32)
+        
+        # Determine anchor
+        phy_anchor = phy_views[:, 0, :, :] if len(phy_views.shape) == 4 else phy_views
 
-            z_sys, z_res, _ = self.encoder([phy_anchor, res_data], training=False)
-            recons_phy, recons_res = self.decoder([z_sys, z_res], training=False)
+        # Batched inference to prevent GPU OOM
+        z_sys_list, z_res_list = [], []
+        for i in range(0, len(phy_anchor), batch_size):
+            p_batch = phy_anchor[i:i+batch_size]
+            r_batch = res_data[i:i+batch_size]
+            zs, zr, _ = self.encoder([p_batch, r_batch], training=False)
+            z_sys_list.append(zs)
+            z_res_list.append(zr)
+        
+        z_sys = tf.concat(z_sys_list, axis=0)
+        z_res = tf.concat(z_res_list, axis=0)
+        
+        # Batched decoding
+        phy_hat_list, res_hat_list = [], []
+        for i in range(0, len(z_sys), batch_size):
+            ph, rh = self.decoder([z_sys[i:i+batch_size], z_res[i:i+batch_size]], training=False)
+            phy_hat_list.append(ph)
+            res_hat_list.append(rh)
             
-            return {
-                "phy_orig": phy_anchor.numpy(), # 3D only for the scorer
-                "phy_hat": recons_phy.numpy(),
-                "res_orig": res_data.numpy(),
-                "res_hat": recons_res.numpy()
-            }
+        return {
+            "phy_orig": phy_anchor.numpy(),
+            "phy_hat": tf.concat(phy_hat_list, axis=0).numpy(),
+            "res_orig": res_data.numpy(),
+            "res_hat": tf.concat(res_hat_list, axis=0).numpy()
+        }

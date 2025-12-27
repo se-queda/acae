@@ -1,14 +1,12 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models, regularizers
 
-# Use namespace as per your preference
+# Preferred persona namespace
 namespace = tf.keras
 
+REG = 1e-4
+
 class ResidualBlock(layers.Layer):
-    """
-    Stabilizes gradient flow for the Hamiltonian network.
-    Mirroring the ResNet-1D architecture from the paper[cite: 387].
-    """
     def __init__(self, units, dropout=0.1, **kwargs):
         super(ResidualBlock, self).__init__(**kwargs)
         self.units = units
@@ -33,25 +31,37 @@ class ResidualBlock(layers.Layer):
         x = self.dense2(x)
         if self.shortcut_layer:
             shortcut = self.shortcut_layer(shortcut)
-        # FIX: Use raw tensor addition instead of instantiating layers.Add() in call
         return x + shortcut
+    
+    
+def tcn_projector(x,projection_dim = 256):
+    x = layers.Dense(projection_dim, 
+                     kernel_regularizer=regularizers.l2(REG),
+                     name="Linear_Projection")(x)
+    # The paper applies the mask AFTER this projection[cite: 296, 307].
+    return x
+
+def hnn_projector(x, projection_dim=256):
+    # 1x1: Point-wise semantic mapping
+    x = layers.Conv1D(projection_dim, 1, padding='same', activation='tanh',
+                      kernel_regularizer=regularizers.l2(REG))(x)
+    # 3x3: Local neighborhood trends
+    x = layers.Conv1D(projection_dim, 3, padding='same', activation='tanh',
+                      kernel_regularizer=regularizers.l2(REG))(x)
+    # 7x7: Wider contextual window
+    x = layers.Conv1D(projection_dim, 7, padding='same', activation='tanh',
+                      kernel_regularizer=regularizers.l2(REG))(x)
+    x = layers.BatchNormalization()(x)
+    return x
 
 class SymplecticLeapfrogLayer(layers.Layer):
-    """
-    The Physics Engine. Replaces the 1D-CNN backbone.
-    dq/dt = dH/dp, dp/dt = -dH/dq.
-    """
-    def __init__(self, feature_dim=128, steps=3, dt=0.1, **kwargs):
+    def __init__(self, feature_dim, steps, dt, **kwargs):
         super(SymplecticLeapfrogLayer, self).__init__(**kwargs)
         self.feature_dim = feature_dim
         self.steps = steps
         self.dt = dt
-        
-        # Scalar Energy Function H(q, p)
-        # We use a pure MLP here to ensure a smooth second-order gradient path.
-        self.h_dense1 = layers.Dense(256, activation='tanh')
-        self.h_dense2 = layers.Dense(256, activation='tanh')
-        # FIX: use_bias=False prevents the "No gradients exist" warning for bias
+        self.h_dense1 = layers.Dense(feature_dim * 2, activation='relu')
+        self.h_dense2 = layers.Dense(feature_dim * 2, activation='relu')
         self.h_out = layers.Dense(1, use_bias=False, name="h_out") 
 
     def get_gradients(self, q, p):
@@ -65,76 +75,117 @@ class SymplecticLeapfrogLayer(layers.Layer):
         return dH[:, self.feature_dim:], -dH[:, :self.feature_dim]
 
     def call(self, x):
-        # Extract initial canonical coordinates
         q = x[:, -1, :] 
         p = x[:, -1, :] - x[:, -2, :] 
-        
         for _ in range(self.steps):
             dq, dp = self.get_gradients(q, p)
             p = p + 0.5 * self.dt * dp
             q = q + self.dt * dq
             _, dp_final = self.get_gradients(q, p)
             p = p + 0.5 * self.dt * dp_final
-            
         return tf.concat([q, p], axis=-1)
 
-def build_projection_head(input_shape=(64, 22)):
-    # Matches the paper's multi-scale architecture [cite: 338, 380]
-    inputs = layers.Input(shape=input_shape)
-    x = layers.Conv1D(128, 1, padding='same', activation='tanh')(inputs)
-    x = layers.Conv1D(128, 3, padding='same', activation='tanh')(x)
-    x = layers.Conv1D(128, 7, padding='same', activation='tanh')(x)
-    return models.Model(inputs, x, name="ProjectionHead")
 
-def build_dual_encoder(input_shape_sys, input_shape_res, latent_dim=256):
-    # Inputs for both anchors
+
+# Global Regularization Factor
+REG = 1e-4
+
+def tcn_block(x, filters, dilation, dropout=0.1):
+    """
+    Standard Residual TCN Block with L2 Regularization and Spatial Dropout.
+    """
+    shortcut = x
+    
+    # Adjust shortcut dimension if filters don't match
+    if x.shape[-1] != filters:
+        shortcut = layers.Conv1D(filters, 1, padding='same', 
+                                 kernel_regularizer=regularizers.l2(REG))(x)
+        
+    # Dilated Convolution Path
+    x = layers.Conv1D(filters, kernel_size=3, dilation_rate=dilation, 
+                      padding='same', kernel_regularizer=regularizers.l2(REG))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.SpatialDropout1D(dropout)(x) # Better than standard dropout for temporal data
+    
+    x = layers.Conv1D(filters, kernel_size=3, dilation_rate=dilation, 
+                      padding='same', kernel_regularizer=regularizers.l2(REG))(x)
+    x = layers.BatchNormalization()(x)
+    
+    # Residual Addition
+    x = layers.Add()([x, shortcut])
+    return layers.Activation('relu')(x)
+
+
+def build_dual_encoder(input_shape_sys, input_shape_res, config):
+    L = config.get("latent_dim", 512) 
+    h_dim = config.get("hnn_feature_dim", 256) 
+    drop_rate = config.get("dropout", 0.1)
+    
     inputs_sys = layers.Input(shape=input_shape_sys, name="input_sys")
     inputs_res = layers.Input(shape=input_shape_res, name="input_res")
     
-    # --- Branch A: System Dynamics (HNN) ---
-    proj_sys = build_projection_head(input_shape_sys)(inputs_sys)
-    flow = SymplecticLeapfrogLayer(feature_dim=128)(proj_sys)
-    x_sys = ResidualBlock(512)(flow)
-    z_sys = layers.Dense(latent_dim // 2, name="z_sys")(x_sys)
+    # --- Branch A: Hamiltonian Dynamics (Consensus) ---
+    proj_hnn = hnn_projector(inputs_sys, projection_dim=h_dim)
     
-    # --- Branch B: Residual Sentinel (Identity) ---
-    # We use a simpler path for the lone-wolf/dead sensors 
-    # to avoid polluting the HNN manifold.
-    x_res = layers.Flatten()(inputs_res)
-    x_res = layers.Dense(256, activation='tanh')(x_res)
-    z_res = layers.Dense(latent_dim // 2, name="z_res")(x_res)
+    # Leapfrog remains the core physics engine
+    flow = SymplecticLeapfrogLayer(
+        feature_dim=h_dim, 
+        steps=config.get("hnn_steps", 3), 
+        dt=config.get("hnn_dt", 0.1)
+    )(proj_hnn)
     
-    # Concatenate for the Discriminator, but keep them separate for Decoders
+    # Added Residual Connection around HNN output
+    x_sys = layers.Dense(L // 2, activation='tanh', 
+                         kernel_regularizer=regularizers.l2(REG))(flow)
+    x_sys = layers.Dropout(drop_rate)(x_sys)
+    z_sys = layers.Dense(L // 2, name="z_sys")(x_sys)
+    
+    # --- Branch B: TCN (Uses Paper's Faithful Linear Projection) ---
+    x_tcn = tcn_projector(inputs_res, h_dim) 
+    x_tcn = tcn_block(x_tcn, 64, dilation=1)
+    x_tcn = tcn_block(x_tcn, 128, dilation=2)
+    x_tcn = layers.GlobalAveragePooling1D()(x_tcn)
+    z_res = layers.Dense(L // 2, name="z_res")(x_tcn)
+    
     z_combined = layers.Concatenate(name="z_combined")([z_sys, z_res])
-    
-    return models.Model([inputs_sys, inputs_res], [z_sys, z_res, z_combined], name="DualEncoder")
+    return models.Model([inputs_sys, inputs_res], [z_sys, z_res, z_combined])
 
-def build_dual_decoder(latent_dim=256, output_steps=64, feat_sys=22, feat_res=16):
-    # We use half the latent for each branch
-    z_sys_in = layers.Input(shape=(latent_dim // 2,))
-    z_res_in = layers.Input(shape=(latent_dim // 2,))
-    
-    # --- Decoder A: Reconstruct System Dynamics ---
-    x_s = layers.Dense(512, activation='tanh')(z_sys_in)
-    x_s = ResidualBlock(512)(x_s)
-    x_s = layers.Dense(output_steps * 128, activation='tanh')(x_s)
-    x_s = layers.Reshape((output_steps, 128))(x_s)
-    out_sys = layers.Conv1D(feat_sys, 1, padding='same')(x_s)
-    
-    # --- Decoder B: Reconstruct Residual/Sentinel ---
-    # This branch learns the "Silence" (0.0) of dead features 
-    # and the "Noise" of lone wolves.
-    x_r = layers.Dense(256, activation='tanh')(z_res_in)
-    x_r = layers.Dense(output_steps * feat_res, activation='tanh')(x_r)
-    out_res = layers.Reshape((output_steps, feat_res))(x_r)
-    
-    return models.Model([z_sys_in, z_res_in], [out_sys, out_res], name="DualDecoder")
 
-def build_discriminator(latent_dim=256):
-    # Standard ACAE decomposition MLP [cite: 430, 436]
-    inputs = layers.Input(shape=(latent_dim * 2,))
-    x = layers.Dense(256, activation='relu')(inputs)
+def build_dual_decoder(feat_sys, feat_res, output_steps, config):
+    L = config.get("latent_dim", 512)
+    drop_rate = config.get("dropout", 0.1)
+    
+    z_sys_in = layers.Input(shape=(L // 2,))
+    z_res_in = layers.Input(shape=(L // 2,))
+    
+    # --- Decoder A: Physics Path (HNN) ---
+    x_s = layers.Dense(output_steps * 64, activation='tanh', 
+                       kernel_regularizer=regularizers.l2(REG))(z_sys_in)
+    x_s = layers.Reshape((output_steps, 64))(x_s)
+    x_s = layers.Conv1D(feat_sys, 1, padding='same', 
+                        kernel_regularizer=regularizers.l2(REG))(x_s)
+    out_sys = layers.Activation('linear', name='out_phy')(x_s)
+    
+    # --- Decoder B: TCN Path (Residual) ---
+    x_r = layers.Dense(output_steps * 64, activation='relu', 
+                       kernel_regularizer=regularizers.l2(REG))(z_res_in)
+    x_r = layers.Reshape((output_steps, 64))(x_r)
+    # Mirroring the TCN block structure in the decoder
+    x_r = tcn_block(x_r, 128, dilation=2, dropout=drop_rate)
+    x_r = layers.Conv1D(feat_res, 1, padding='same', 
+                        kernel_regularizer=regularizers.l2(REG))(x_r)
+    out_res = layers.Activation('linear', name='out_res')(x_r)
+    
+    return models.Model([z_sys_in, z_res_in], [out_sys, out_res])
+
+
+def build_discriminator(input_dim):
+    # ACAE Discriminator uses dropout of 0.5 
+    inputs = layers.Input(shape=(input_dim,))
+    x = layers.Dense(512, activation='relu')(inputs)
+    x = layers.Dropout(0.5)(x) 
+    x = layers.Dense(256, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
-    x = layers.Dense(128, activation='relu')(x)
     outputs = layers.Dense(2, activation=None)(x) 
-    return models.Model(inputs, outputs, name="Discriminator")
+    return models.Model(inputs, outputs)
