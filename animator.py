@@ -142,4 +142,4 @@ if __name__ == "__main__":
         "lambda_d": 1.0, "lambda_e": 1.0, "alpha_vpo": 2.0, "sentinel_weight": 5.0
     }
     data_path_root = "/home/utsab/Downloads/smd/ServerMachineDataset"
-    run_dual_animation("machine-1-3", data_path_root, main_config, n_samples=5000)
+    run_dual_animation("machine-1-1", data_path_root, main_config, n_samples=5000)
