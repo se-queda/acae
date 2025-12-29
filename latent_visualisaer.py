@@ -158,13 +158,13 @@ def visualize_dual_latent_space(config, test_final, weights_path, machine_name="
     # Consensus Path (HNN) - Expected to be circular for PSM [cite: 624, 626]
     ax1.scatter(z_s_2d[~lbls, 0], z_s_2d[~lbls, 1], c='royalblue', label='Normal', alpha=0.4, s=8)
     ax1.scatter(z_s_2d[lbls, 0], z_s_2d[lbls, 1], c='crimson', label='Anomaly', marker='x', s=12)
-    ax1.set_title(f"PSM Consensus Manifold (HNN)\nTarget: Circular Distribution [cite: 624]")
+    ax1.set_title(f"HNN Consensus Manifold (HNN)")
     ax1.legend()
 
     # Residual Path (TCN) - High-level semantic separation [cite: 633]
     ax2.scatter(z_r_2d[~lbls, 0], z_r_2d[~lbls, 1], c='seagreen', label='Normal', alpha=0.4, s=8)
     ax2.scatter(z_r_2d[lbls, 0], z_r_2d[lbls, 1], c='darkorange', label='Anomaly', marker='x', s=12)
-    ax2.set_title(f"PSM Residual Manifold (TCN)\nTarget: Semantic Separation [cite: 633]")
+    ax2.set_title(f"TCN Residual Manifold")
     ax2.legend()
     
     plt.tight_layout()

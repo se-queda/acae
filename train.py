@@ -237,19 +237,14 @@ def worker_task(mid, config, csv_path):
         traceback.print_exc()
 
 def run_all_entities(config):
-    # 1. Retrieve values explicitly from the config passed by main()
     dataset_type = config.get("dataset", "SMD").upper()
     data_root = config.get("data_root")
     
-    # 🔍 SAFETY CHECK: Ensure the path isn't None before joining
-    if data_root is None:
-        raise ValueError(f"❌ Data root for {dataset_type} is None. Check your config.yaml paths.")
-
-    # --- 2. ID Discovery ---
+    # --- 1. ID Discovery ---
     if dataset_type == "PSM":
         machine_ids = ["PSM_Pooled"]
     else:
-        # Determine file extension based on dataset [cite: 533]
+        # Determine file extension based on dataset
         ext = ".txt" if dataset_type == "SMD" else ".npy"
         train_path = os.path.join(data_root, "train")
         
@@ -264,20 +259,19 @@ def run_all_entities(config):
     os.makedirs("results", exist_ok=True)
     csv_path = f"results/final_{dataset_type}_baseline.csv"
 
-    # Initialize CSV with headers if it doesn't exist [cite: 508, 512, 515]
     if not os.path.isfile(csv_path):
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["id", "auc", "fc1", "pa_k_auc", "f1_std", "f1_pa", "precision", "recall"])
 
-    # Sequential execution for GPU stability and early stopping [cite: 545]
+    # Sequential execution for GPU stability
     for mid in machine_ids:
         p = mp.Process(target=worker_task, args=(mid, config, csv_path))
         p.start()
         p.join()
 
-
 def main():
+    # Set the multiprocessing start method globally before any TF imports
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
@@ -285,42 +279,32 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--all", action="store_true")
+    # Optional override for quick testing
+    parser.add_argument("--id", type=str, help="Specify a single machine/channel ID to test")
     args = parser.parse_args()
 
-    # 1. Load the base config (this contains the 'datasets' block)
-    base_config = load_config(args.config)
+    # Assuming load_config is available in your environment
+    config = load_config(args.config)
+    dataset_type = config.get("dataset", "SMD").upper()
     
-    # Target datasets in order
-    target_datasets = ["PSM", "SMD", "MSL", "SMAP"]
-    print(f"\n📡 Dual-Anchor Engine Benchmarking Suite Initiated")
-    for ds_name in target_datasets:
-        print(f"\n{'='*60}\n📡 BENCHMARKING: {ds_name}\n{'='*60}")
-
-        # 2. Create a fresh copy for this specific dataset
-        config = base_config.copy()
-        config["dataset"] = ds_name
-        
-        # 3. CRITICAL: Pull the path from the nested YAML structure [cite: 533]
-        # This maps base_config['datasets'][ds_name]['data_root'] -> config['data_root']
-        try:
-            config["data_root"] = base_config["datasets"][ds_name]["data_root"]
-        except KeyError:
-            print(f"❌ Error: Dataset {ds_name} or its data_root not found in config.yaml")
-            continue
-        
-        # Ensure results directory exists
-        os.makedirs("results", exist_ok=True)
-
-        if ds_name == "PSM":
-            # PSM is typically a single file execution [cite: 533]
-            mid = "PSM_Pooled" # or your specific PSM filename
-            csv_path = f"results/final_{ds_name}_baseline.csv"
-            p = mp.Process(target=worker_task, args=(mid, config, csv_path))
-            p.start()
-            p.join()
+    if args.all:
+        run_all_entities(config)
+    else:
+        # Logic for a single-point test run
+        if args.id:
+            mid = args.id
         else:
-            # Iterates through the directories for SMD, MSL, and SMAP [cite: 533]
-            run_all_entities(config)
+            # Smart defaults for single runs based on dataset
+            defaults = {"SMD": "machine-1-1", "MSL": "T-10", "SMAP": "P-1", "PSM": "PSM_Pooled"}
+            mid = defaults.get(dataset_type, "test_entity")
+
+        print(f"🧪 Starting single-entity test run: {mid}")
+        csv_path = f"results/single_test_{dataset_type}.csv"
+        
+        p = mp.Process(target=worker_task, args=(mid, config, csv_path))
+        p.start()
+        p.join()
 
 if __name__ == "__main__":
     main()
