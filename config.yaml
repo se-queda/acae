@@ -28,9 +28,24 @@
  lambda_e: 1.0          # Encoder loss weight λ2 [cite: 475, 544]
  recon_weight: 1.0      # Reconstruction loss weight [cite: 475]
  lambda_mom: 0.5        # Momentum/Physics-constraint weight
- alpha_vpo: 800.0  # Hamiltonian violation penalty
+ alpha_vpo: 150.0  # Hamiltonian violation penalty
  sentinel_weight: 10.0     
 
 # --- Training Loop ---
  epochs: 200           # 
- patience: 8            # Early stopping patience
+ patience: 10            # Early stopping patience
+
+
+# Update these paths to match your local directory structure
+
+ datasets:
+  MSL: 
+    data_root: "/home/utsab/Downloads/MSL" # [cite: 504, 533]
+  SMAP: 
+    data_root: "/home/utsab/Downloads/SMAP" # [cite: 504, 533]
+  SMD: 
+    data_root: "/home/utsab/Downloads/smd/ServerMachineDataset" # [cite: 501, 533]
+  PSM:  
+    data_root: "/home/utsab/Downloads/PSM" # [cite: 503, 533]
+  SWAT:
+    data_root: "/home/utsab/Downloads/SWAT" 

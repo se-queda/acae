@@ -121,25 +121,28 @@ def build_dual_encoder(input_shape_sys, input_shape_res, config):
     L = config.get("latent_dim", 512) 
     h_dim = config.get("hnn_feature_dim", 256) 
     drop_rate = config.get("dropout", 0.1)
-    
+    feat_sys = input_shape_sys[1]
     inputs_sys = layers.Input(shape=input_shape_sys, name="input_sys")
     inputs_res = layers.Input(shape=input_shape_res, name="input_res")
     
-    # --- Branch A: Hamiltonian Dynamics (Consensus) ---
-    proj_hnn = hnn_projector(inputs_sys, projection_dim=h_dim)
-    
-    # Leapfrog remains the core physics engine
-    flow = SymplecticLeapfrogLayer(
-        feature_dim=h_dim, 
-        steps=config.get("hnn_steps", 3), 
-        dt=config.get("hnn_dt", 0.1)
-    )(proj_hnn)
-    
-    # Added Residual Connection around HNN output
-    x_sys = layers.Dense(L // 2, activation='tanh', 
-                         kernel_regularizer=regularizers.l2(REG))(flow)
-    x_sys = layers.Dropout(drop_rate)(x_sys)
-    z_sys = layers.Dense(L // 2, name="z_sys")(x_sys)
+    if feat_sys>0:
+        # --- Branch A: Hamiltonian Dynamics (Consensus) ---
+        proj_hnn = hnn_projector(inputs_sys, projection_dim=h_dim)
+        
+        # Leapfrog remains the core physics engine
+        flow = SymplecticLeapfrogLayer(
+            feature_dim=h_dim, 
+            steps=config.get("hnn_steps", 3), 
+            dt=config.get("hnn_dt", 0.1)
+        )(proj_hnn)
+        
+        # Added Residual Connection around HNN output
+        x_sys = layers.Dense(L // 2, activation='tanh', 
+                                kernel_regularizer=regularizers.l2(REG))(flow)
+        x_sys = layers.Dropout(drop_rate)(x_sys)
+        z_sys = layers.Dense(L // 2, name="z_sys")(x_sys)
+    else:
+        z_sys = layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], L // 2)), name="z_sys")(inputs_sys)
     
     # --- Branch B: TCN (Uses Paper's Faithful Linear Projection) ---
     x_tcn = tcn_projector(inputs_res, h_dim) 
@@ -163,9 +166,12 @@ def build_dual_decoder(feat_sys, feat_res, output_steps, config):
     x_s = layers.Dense(output_steps * 64, activation='tanh', 
                        kernel_regularizer=regularizers.l2(REG))(z_sys_in)
     x_s = layers.Reshape((output_steps, 64))(x_s)
-    x_s = layers.Conv1D(feat_sys, 1, padding='same', 
+    if feat_sys > 0:
+        x_s = layers.Conv1D(feat_sys, 1, padding='same', 
                         kernel_regularizer=regularizers.l2(REG))(x_s)
-    out_sys = layers.Activation('linear', name='out_phy')(x_s)
+        out_sys = layers.Activation('linear', name='out_phy')(x_s)
+    else:
+        out_sys = layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], output_steps, 0)), name='out_phy')(x_s) 
     
     # --- Decoder B: TCN Path (Residual) ---
     x_r = layers.Dense(output_steps * 64, activation='relu', 

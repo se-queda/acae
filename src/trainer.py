@@ -54,12 +54,23 @@ class DualAnchorACAETrainer:
             j_abs = tf.abs(jerk_phy)
             j_thresh = tf.reduce_mean(j_abs) + tf.math.reduce_std(j_abs)
             vpo_weights = tf.where(j_abs > j_thresh, self.alpha_vpo, 1.0)
-            recon_phy_loss = tf.reduce_mean(tf.square(anchor_phy - recons_phy) * vpo_weights)
-            
+            if self.topo.idx_phy.shape[0] > 0:
+                recon_phy_loss = tf.reduce_mean(tf.square(anchor_phy - recons_phy) * vpo_weights)
+            else:
+                recon_phy_loss= tf.constant(0.0, dtype=tf.float32)
+
             # 4. Residual & Sentinel Loss
             recon_res_loss = tf.reduce_mean(tf.square(res_windows - recons_res))
-            dead_recons = tf.gather(recons_res, self.topo.res_to_dead_local, axis=-1)
-            sentinel_loss = tf.reduce_mean(tf.square(dead_recons - 0.0))
+            
+            # Check if dead sensors exist to avoid dtype errors and NaN loss
+            if len(self.topo.res_to_dead_local) > 0:
+                # Explicit cast to int32 prevents the float32 DataType mismatch
+                dead_idx = tf.cast(self.topo.res_to_dead_local, tf.int32)
+                dead_recons = tf.gather(recons_res, dead_idx, axis=-1)
+                sentinel_loss = tf.reduce_mean(tf.square(dead_recons - 0.0))
+            else:
+                # Provide a zero scalar if no dead sensors are present
+                sentinel_loss = tf.constant(0.0)
             
             total_recon_loss = recon_phy_loss + recon_res_loss + (self.sentinel_weight * sentinel_loss)
 

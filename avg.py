@@ -1,35 +1,63 @@
 import pandas as pd
-import io
+import os
 
-def calculate_fleet_averages(file_path):
-    # This handles files that have extra info lines at the top
-    try:
-        # First attempt: standard CSV
-        df = pd.read_csv(file_path, comment='#')
-        # If 'machine_id' isn't the first column, it might be a commented header
-        if 'machine_id' not in df.columns:
-            df = pd.read_csv(file_path, skiprows=1)
-    except Exception:
-        print(f"Skipping {file_path} - check format.")
+def calculate_fleet_averages(name, file_path):
+    if not os.path.exists(file_path):
+        print(f"⚠️ File not found for {name}: {file_path}")
         return None
 
-    # Calculate means for the core metrics
-    averages = df[['auc', 'fc1', 'pa_k_auc']].mean()
-    return averages
+    try:
+        df = pd.read_csv(file_path)
+        # Clean whitespace from headers just in case
+        df.columns = df.columns.str.strip()
+        
+        # Core metrics to average
+        metrics = ['auc', 'fc1', 'pa_k_auc']
+        
+        # Check for ID columns based on your specific dataset mappings
+        if name == "SMD":
+            id_col = 'machine_id'
+        else:
+            id_col = 'id'
+            
+        if id_col not in df.columns:
+            # Fallback: if 'id' isn't there, just look for whatever the first column is
+            id_col = df.columns[0]
+            print(f"🔍 {name}: Using '{id_col}' as the identifier.")
 
-# --- YOUR FILES ---
+        # Ensure metrics are numeric (handles empty rows or strings)
+        for col in metrics:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Drop rows where metrics might be NaN (failed runs)
+        df = df.dropna(subset=metrics)
+        
+        return {
+            "count": len(df),
+            "means": df[metrics].mean()
+        }
+    except Exception as e:
+        print(f"💥 Error processing {name}: {e}")
+        return None
+
+# Mapping paths based on your previous directory structure
 files = {
-    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN": "results/acae_hnn_sobolev_consensus.csv",
-    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN +mlp + dual latent": "results/final_acae_hnn_sobolev_consensus_duaLatent.csv",
-    "Univariate jerk + consensus mask + weighted loss+ High-Res HNN + TCN+ dual latent": "results/acae_hnn_sobolev_TCN_consensus_duaLatent.csv",
-    
+    "PSM": "dataset_benchmarks/PSM.csv",
+    "SMAP": "dataset_benchmarks/SMAP.csv",
+    "SMD": "dataset_benchmarks/SMD.csv",
+    "MSL": "dataset_benchmarks/MSL.csv"
 }
 
-print("--- GLOBAL FLEET AVERAGES (28 MACHINES) ---")
+print("📊 Dual-Anchor Engine: Final Benchmark Summary")
+print("="*50)
+
 for name, path in files.items():
-    avg = calculate_fleet_averages(path)
-    if avg is not None:
-        print(f"\n🚀 {name}:")
+    result = calculate_fleet_averages(name, path)
+    if result is not None:
+        avg = result["means"]
+        print(f"\n🚀 {name} ({result['count']} entities):")
         print(f"  AUC:   {avg['auc']:.4f}")
         print(f"  Fc1:   {avg['fc1']:.4f}")
         print(f"  PA%K:  {avg['pa_k_auc']:.4f}")
+
+print("\n" + "="*50)
