@@ -42,26 +42,36 @@ def tcn_projector(x,projection_dim = 256):
     return x
 
 def hnn_projector(x, projection_dim=256):
-    # 1x1: Point-wise semantic mapping
-    x = layers.Conv1D(projection_dim, 1, padding='same', activation='tanh',
-                      kernel_regularizer=regularizers.l2(REG))(x)
-    # 3x3: Local neighborhood trends
-    x = layers.Conv1D(projection_dim, 3, padding='same', activation='tanh',
-                      kernel_regularizer=regularizers.l2(REG))(x)
-    # 7x7: Wider contextual window
-    x = layers.Conv1D(projection_dim, 7, padding='same', activation='tanh',
-                      kernel_regularizer=regularizers.l2(REG))(x)
-    x = layers.BatchNormalization()(x)
-    return x
+    for i in range(5):
+        dilation = 2**i
+        shortcut = x
+        if x.shape[-1] != projection_dim:
+            shortcut = layers.Conv1D(projection_dim, 1, padding='same')(x)
+        x = layers.Conv1D(
+            filters=projection_dim,
+            kernel_size=3,
+            dilation_rate=dilation,
+            padding='causal', 
+            activation='tanh', 
+            kernel_regularizer=regularizers.l2(REG)
+        )(x)
+        x = layers.BatchNormalization()(x)
+        
+        # Add residual connection
+        x = layers.Add()([x, shortcut])
+        x = layers.Activation('tanh')(x)
+        
+    return x # Shape: (Batch, 64, 256)
 
-class SymplecticLeapfrogLayer(layers.Layer):
+class BiDirectionalSymplecticLayer(layers.Layer):
     def __init__(self, feature_dim, steps, dt, **kwargs):
-        super(SymplecticLeapfrogLayer, self).__init__(**kwargs)
+        super(BiDirectionalSymplecticLayer, self).__init__(**kwargs)
         self.feature_dim = feature_dim
         self.steps = steps
         self.dt = dt
-        self.h_dense1 = layers.Dense(feature_dim * 2, activation='relu')
-        self.h_dense2 = layers.Dense(feature_dim * 2, activation='relu')
+        # The internal Hamiltonian MLP stays the same
+        self.h_dense1 = layers.Dense(feature_dim * 2, activation='tanh') # Changed to tanh for HNN stability
+        self.h_dense2 = layers.Dense(feature_dim * 2, activation='tanh')
         self.h_out = layers.Dense(1, use_bias=False, name="h_out") 
 
     def get_gradients(self, q, p):
@@ -72,18 +82,42 @@ class SymplecticLeapfrogLayer(layers.Layer):
             x = self.h_dense2(x)
             H = self.h_out(x)
         dH = tape.gradient(H, state_p)
+        # Returns dq (dH/dp) and dp (-dH/dq)
         return dH[:, self.feature_dim:], -dH[:, :self.feature_dim]
 
+    def leapfrog_step(self, q, p, dt):
+        # Standard Symplectic Leapfrog Step
+        dq, dp = self.get_gradients(q, p)
+        p = p + 0.5 * dt * dp
+        q = q + dt * dq
+        _, dp_final = self.get_gradients(q, p)
+        p = p + 0.5 * dt * dp_final
+        return q, p
+
     def call(self, x):
-        q = x[:, -1, :] 
-        p = x[:, -1, :] - x[:, -2, :] 
-        for _ in range(self.steps):
-            dq, dp = self.get_gradients(q, p)
-            p = p + 0.5 * self.dt * dp
-            q = q + self.dt * dq
-            _, dp_final = self.get_gradients(q, p)
-            p = p + 0.5 * self.dt * dp_final
-        return tf.concat([q, p], axis=-1)
+        # 1. Anchor at the Midpoint (Center of the 64-step window)
+        # This prevents the 'retarded' logic of guessing from the edge.
+        mid_idx = x.shape[1] // 2 
+        
+        # Extract coordinates at the center
+        q_mid = x[:, mid_idx, :] 
+        p_mid = x[:, mid_idx, :] - x[:, mid_idx - 1, :] 
+        
+        # 2. Forward Integration (+dt) from center to end
+        # Covers the second half of the window
+        q_f, p_f = q_mid, p_mid
+        for _ in range(self.steps // 2):
+            q_f, p_f = self.leapfrog_step(q_f, p_f, self.dt)
+            
+        # 3. Backward Integration (-dt) from center to start
+        # Reconstructs the first half of the window
+        q_b, p_b = q_mid, p_mid
+        for _ in range(self.steps // 2):
+            q_b, p_b = self.leapfrog_step(q_b, p_b, -self.dt)
+            
+        # Now returning: [Reconstructed Start, Reconstructed Center, Reconstructed End]
+        # This forces the decoder to match the HNN trajectory to the raw data at 3 points.
+        return tf.concat([q_b, p_b, q_mid, p_mid, q_f, p_f], axis=-1)
 
 
 
@@ -130,7 +164,7 @@ def build_dual_encoder(input_shape_sys, input_shape_res, config):
         proj_hnn = hnn_projector(inputs_sys, projection_dim=h_dim)
         
         # Leapfrog remains the core physics engine
-        flow = SymplecticLeapfrogLayer(
+        flow = BiDirectionalSymplecticLayer(
             feature_dim=h_dim, 
             steps=config.get("hnn_steps", 3), 
             dt=config.get("hnn_dt", 0.1)

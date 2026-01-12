@@ -6,13 +6,13 @@
  val_split: 0.2         # Training data split 
 
 # --- Model Hyperparameters ---
- latent_dim: 512        # Total (z_sys[256] + z_res[256])
+ latent_dim: 256        # Total (z_sys[256] + z_res[256])
  lr: 0.0001             # Adam optimizer learning rate [cite: 545]
 
 # --- Hamiltonian Physics Parameters ---
- hnn_steps: 3           # Integration steps for Leapfrog
- hnn_dt: 0.1            # Time step for symplectic flow
- hnn_feature_dim: 256   # Hidden dimension for HNN MLP
+ hnn_steps: 16         # Integration steps for Leapfrog
+ hnn_dt: 0.05            # Time step for symplectic flow
+ hnn_feature_dim: 13   # Hidden dimension for HNN MLP
 
 # --- Physics-Informed Preprocessing (Moved from utils.py) ---
  savgol_len: 11         # Window length for Jerk smoothing
@@ -32,9 +32,9 @@
  sentinel_weight: 10.0     
 
 # --- Training Loop ---
- epochs: 1           # 
- patience: 10            # Early stopping patience
+ epochs: 20           # 
+ patience: 5           # Early stopping patience
 
 
- dataset: MSL         # Dataset type: PSM
- data_root: /home/utsab/Downloads/MSL # Root data directory
+ dataset: PSM         # Dataset type: SMD
+ data_root: /home/utsab/Downloads/PSM # Root data directory
