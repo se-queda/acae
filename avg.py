@@ -42,10 +42,12 @@ def calculate_fleet_averages(name, file_path):
 
 # Mapping paths based on your previous directory structure
 files = {
-    "PSM": "dataset_benchmarks/PSM.csv",
-    "SMAP": "dataset_benchmarks/SMAP.csv",
-    "SMD": "dataset_benchmarks/SMD.csv",
-    "MSL": "dataset_benchmarks/MSL.csv"
+    "PSM_HNN_TCN": "dataset_benchmarks/PSM.csv",
+    "SMD_HNN_TCN": "dataset_benchmarks/SMD.csv",
+    "MSL_HNN_TCN": "dataset_benchmarks/MSL.csv",
+    "PSM_HNN_FNO": "dataset_benchmarks/PSM_FNO.csv",
+    "SMD_HNN_FNO": "dataset_benchmarks/SMD_FNO.csv",
+    "MSL_HNN_FNO": "dataset_benchmarks/MSL_FNO.csv"
 }
 
 print("📊 Dual-Anchor Engine: Final Benchmark Summary")

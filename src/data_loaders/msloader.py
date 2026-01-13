@@ -5,7 +5,7 @@ import ast
 from sklearn.preprocessing import StandardScaler
 
 # Internal imports
-from src.router import route_features
+from src.router import route_features, MachineTopology
 from src.masking import get_masked_views, resi_masker
 from src.utils import calculate_physics_jerk, create_spline_envelopes
 
@@ -35,20 +35,10 @@ def load_msl_windows(data_root, machine_id, config):
 
     # 2. Routing with Minimum Feature Guard
     (train_phy, train_res, test_phy, test_res), topo, phy_labels = route_features(train_norm, test_norm)
-    
-    # --- 🛡️ HNN Shape Guard ---
-    if train_phy.shape[1] == 0:
-        print(f"⚠️ Warning: {machine_id} has 0 physical features. Forcing highest-variance feature to PHY.")
-        # Find feature with max variance to act as a proxy for the HNN branch
-        vars = np.var(train_norm, axis=0)
-        best_idx = np.argmax(vars)
-        
-        train_phy = train_norm[:, [best_idx]]
-        test_phy = test_norm[:, [best_idx]]
-        # Update topology to reflect the manual move
-        topo.idx_phy = [best_idx]
-        if best_idx in topo.idx_res:
-            topo.idx_res.remove(best_idx)
+
+
+    # cluster labels required by consensus_masker — single cluster id is enough
+    phy_labels = np.zeros(train_phy.shape[1], dtype=int)
 
     # 3. Envelopes & Jerk
     res_envelopes_upper = np.zeros_like(train_res)

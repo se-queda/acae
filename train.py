@@ -296,7 +296,7 @@ def main():
             mid = args.id
         else:
             # Smart defaults for single runs based on dataset
-            defaults = {"SMD": "machine-1-1", "MSL": "T-10", "SMAP": "P-1", "PSM": "PSM_Pooled"}
+            defaults = {"SMD": "machine-3-9", "MSL": "T-10", "SMAP": "P-1", "PSM": "PSM_Pooled"}
             mid = defaults.get(dataset_type, "test_entity")
 
         print(f"🧪 Starting single-entity test run: {mid}")
