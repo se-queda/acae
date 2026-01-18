@@ -136,10 +136,11 @@ def train_on_machine(machine_id, config):
     os.makedirs(save_path, exist_ok=True)
     trainer.encoder.save_weights(f"{save_path}/encoder.weights.h5")
     trainer.decoder.save_weights(f"{save_path}/decoder.weights.h5")
-# 5. Scoring & Diagnostic Normalization
-    recons = trainer.reconstruct(test_final) 
+    # 5. Scoring & Diagnostic Normalization
+    recons = trainer.reconstruct_errors(test_final, batch_size=BS)
     # Paper-aligned sequence length logic 
-    actual_len = (recons['res_orig'].shape[0] - 1) * stride + W
+    num_windows = test_final['res'].shape[0]
+    actual_len = (num_windows - 1) * stride + W
 
     def aggregate_scores(windowed_data, stride, window_size, total_len, is_label=False):
         """Averages overlapping windows into point-wise sequence per Eq 9."""
@@ -165,27 +166,26 @@ def train_on_machine(machine_id, config):
     # Most NASA loaders return flattened (N*W) labels. We must linearize them.
     if test_labels.shape[0] > actual_len:
         print(f"🔄 [REALIGN] Converting {len(test_labels)} windowed labels to {actual_len} linear steps...")
-        windowed_labels = test_labels[:recons['res_orig'].shape[0] * W].reshape(-1, W)
+        windowed_labels = test_labels[:num_windows * W].reshape(-1, W)
         test_labels = aggregate_scores(windowed_labels, stride, W, actual_len, is_label=True)
 
     # 1. Physics Branch [cite: 486, 487]
     if phy_dim > 0:
-        se_p = np.mean(np.square(recons['phy_orig'] - recons['phy_hat']), axis=-1)
+        se_p = recons['se_p']
         e_p = aggregate_scores(se_p, stride, W, actual_len)
     else:
         e_p = np.zeros(actual_len)
 
     # 2. Lone Wolf Branch
-    res_orig, res_hat = recons['res_orig'], recons['res_hat']
     if len(topo.res_to_lone_local) > 0:
-        se_l = np.mean(np.square(res_orig[:, :, topo.res_to_lone_local] - res_hat[:, :, topo.res_to_lone_local]), axis=-1)
+        se_l = recons['se_l']
         e_l = aggregate_scores(se_l, stride, W, actual_len)
     else:
         e_l = np.zeros(actual_len)
 
     # 3. Dead Sentinel Branch
     if len(topo.res_to_dead_local) > 0:
-        se_d = np.mean(np.square(res_orig[:, :, topo.res_to_dead_local] - 0.0), axis=-1)
+        se_d = recons['se_d']
         e_d = aggregate_scores(se_d, stride, W, actual_len)
     else:
         e_d = np.zeros(actual_len)
@@ -209,9 +209,6 @@ def train_on_machine(machine_id, config):
     fc1, pa_auc, f1_std, f1_pa, prec, rec = get_best_metrics(point_scores, test_labels)
     # ... [Rest of returns]
     print(f"🏆 [RESULTS] AUC: {auc_score:.4f} | F1-Score: {fc1:.4f} | PA-AUC: {pa_auc:.4f} | F1-Std: {f1_std:.4f} | F1-PA: {f1_pa:.4f} | Prec: {prec:.4f} | Rec: {rec:.4f}" )
-    K.clear_session()
-
-    gc.collect()
     return auc_score, fc1, pa_auc, f1_std, f1_pa, prec, rec
 
  
@@ -296,7 +293,7 @@ def main():
             mid = args.id
         else:
             # Smart defaults for single runs based on dataset
-            defaults = {"SMD": "machine-3-9", "MSL": "T-10", "SMAP": "P-1", "PSM": "PSM_Pooled"}
+            defaults = {"SMD": "machine-3-1", "MSL": "T-10", "SMAP": "P-1", "PSM": "PSM_Pooled"}
             mid = defaults.get(dataset_type, "test_entity")
 
         print(f"🧪 Starting single-entity test run: {mid}")

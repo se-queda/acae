@@ -1,90 +1,69 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models, regularizers
+from src.mamba import ResidualBlock, ModelArgs
 
 # Preferred persona namespace
 namespace = tf.keras
 
 REG = 1e-4
 
-    
 
-def hnn_projector(x, projection_dim=256):
-    for i in range(5):
-        dilation = 2**i
-        shortcut = x
-        if x.shape[-1] != projection_dim:
-            shortcut = layers.Conv1D(projection_dim, 1, padding='same')(x)
-        x = layers.Conv1D(
-            filters=projection_dim,
-            kernel_size=3,
-            dilation_rate=dilation,
-            padding='causal', 
-            activation='tanh', 
-            kernel_regularizer=regularizers.l2(REG)
-        )(x)
-        x = layers.BatchNormalization()(x)
-        
-        # Add residual connection
-        x = layers.Add()([x, shortcut])
-        x = layers.Activation('tanh')(x)
-        
-    return x # Shape: (Batch, 64, 256)
+class MambaProjector(layers.Layer):
+    """
+    Projects raw telemetry signals into Mamba channel space.
 
-class BiDirectionalSymplecticLayer(layers.Layer):
-    def __init__(self, feature_dim, steps, dt, **kwargs):
-        super(BiDirectionalSymplecticLayer, self).__init__(**kwargs)
-        self.feature_dim = feature_dim
-        self.steps = steps
-        self.dt = dt
-        # The internal Hamiltonian MLP stays the same
-        self.h_dense1 = layers.Dense(feature_dim * 2, activation='tanh') # Changed to tanh for HNN stability
-        self.h_dense2 = layers.Dense(feature_dim * 2, activation='tanh')
-        self.h_out = layers.Dense(1, use_bias=False, name="h_out") 
+    Input:  (B, L, F)   raw sensors
+    Output: (B, L, D)   Mamba channels
+    """
 
-    def get_gradients(self, q, p):
-        state_p = tf.concat([q, p], axis=-1)
-        with tf.GradientTape() as tape:
-            tape.watch(state_p)
-            x = self.h_dense1(state_p)
-            x = self.h_dense2(x)
-            H = self.h_out(x)
-        dH = tape.gradient(H, state_p)
-        # Returns dq (dH/dp) and dp (-dH/dq)
-        return dH[:, self.feature_dim:], -dH[:, :self.feature_dim]
+    def __init__(self, out_dim=256, **kwargs):
+        super().__init__(**kwargs)
+        self.out_dim = out_dim
 
-    def leapfrog_step(self, q, p, dt):
-        # Standard Symplectic Leapfrog Step
-        dq, dp = self.get_gradients(q, p)
-        p = p + 0.5 * dt * dp
-        q = q + dt * dq
-        _, dp_final = self.get_gradients(q, p)
-        p = p + 0.5 * dt * dp_final
-        return q, p
+        # Feature mixing (sensor → latent channels)
+        self.feature_proj = layers.Dense(
+            out_dim,
+            use_bias=True
+        )
+
+        # Light temporal smoothing (important for telemetry)
+        self.temporal_conv = layers.Conv1D(
+            filters=out_dim,
+            kernel_size=5,
+            padding="same",
+            groups=1,
+            use_bias=True
+        )
+
+        self.norm = layers.LayerNormalization(epsilon=1e-5)
 
     def call(self, x):
-        # 1. Anchor at the Midpoint (Center of the 64-step window)
-        # This prevents the 'retarded' logic of guessing from the edge.
-        mid_idx = x.shape[1] // 2 
-        
-        # Extract coordinates at the center
-        q_mid = x[:, mid_idx, :] 
-        p_mid = x[:, mid_idx, :] - x[:, mid_idx - 1, :] 
-        
-        # 2. Forward Integration (+dt) from center to end
-        # Covers the second half of the window
-        q_f, p_f = q_mid, p_mid
-        for _ in range(self.steps // 2):
-            q_f, p_f = self.leapfrog_step(q_f, p_f, self.dt)
-            
-        # 3. Backward Integration (-dt) from center to start
-        # Reconstructs the first half of the window
-        q_b, p_b = q_mid, p_mid
-        for _ in range(self.steps // 2):
-            q_b, p_b = self.leapfrog_step(q_b, p_b, -self.dt)
-            
-        # Now returning: [Reconstructed Start, Reconstructed Center, Reconstructed End]
-        # This forces the decoder to match the HNN trajectory to the raw data at 3 points.
-        return tf.concat([q_b, p_b, q_mid, p_mid, q_f, p_f], axis=-1)
+        """
+        x: (B, L, F)
+        """
+        # Mix sensors into channel space
+        x = self.feature_proj(x)          # (B, L, D)
+
+        # Smooth short-term noise (before SSM)
+        x = self.temporal_conv(x)          # (B, L, D)
+
+        # Normalize for SSM stability
+        x = self.norm(x)
+
+        return x
+
+def mamba_encoder(inputs, args):
+    # inputs: (B, L, F)
+
+    x = MambaProjector(out_dim=args.model_input_dims)(inputs)
+
+    for _ in range(2):
+        x = ResidualBlock(args)(x)
+
+    latent = layers.GlobalAveragePooling1D()(x)
+    return latent
+
+
 
 
 def fno_lifting(x, latent_dim=256):
@@ -161,88 +140,171 @@ def fno_block(x, filters, modes, dropout=0.1):
     return x
 
 
+REG = 1e-4
+
+
 def build_dual_encoder(input_shape_sys, input_shape_res, config):
-    L = config.get("latent_dim", 512) 
-    h_dim = config.get("hnn_feature_dim", 256) 
-    drop_rate = config.get("dropout", 0.1)
+    """
+    Dual-Anchor Encoder
+    - Branch A: Mamba-based consensus encoder (replaces HNN)
+    - Branch B: FNO residual encoder
+    """
+
+    # --------------------------------------------------
+    # Config
+    # --------------------------------------------------
+    L = config.get("latent_dim", 512)              # total latent
+    dim = config.get("mamba_dim", 256)           # mamba channel dim
+    drop_rate = config.get("dropout", 0.0)         # keep 0 for now
+    f_modes = config.get("fno_modes", 32)
+
     feat_sys = input_shape_sys[1]
+
+    # --------------------------------------------------
+    # Inputs
+    # --------------------------------------------------
     inputs_sys = layers.Input(shape=input_shape_sys, name="input_sys")
     inputs_res = layers.Input(shape=input_shape_res, name="input_res")
-    f_modes = config.get("fno_modes", 32)
-    
-    if feat_sys>0:
-        # --- Branch A: Hamiltonian Dynamics (Consensus) ---
-        proj_hnn = hnn_projector(inputs_sys, projection_dim=h_dim)
-        
-        # Leapfrog remains the core physics engine
-        flow = BiDirectionalSymplecticLayer(
-            feature_dim=h_dim, 
-            steps=config.get("hnn_steps", 3), 
-            dt=config.get("hnn_dt", 0.1)
-        )(proj_hnn)
-        
-        # Added Residual Connection around HNN output
-        x_sys = layers.Dense(L // 2, activation='tanh', 
-                                kernel_regularizer=regularizers.l2(REG))(flow)
-        x_sys = layers.Dropout(drop_rate)(x_sys)
-        z_sys = layers.Dense(L // 2, name="z_sys")(x_sys)
+
+    # ==================================================
+    # Branch A: Mamba Consensus Encoder (replaces HNN)
+    # ==================================================
+    if feat_sys > 0:
+        mamba_args = ModelArgs(
+            model_input_dims=dim,
+            model_states=config.get("mamba_states", 32),
+            seq_length=input_shape_sys[0]
+        )
+
+        sys_latent = mamba_encoder(inputs_sys, mamba_args)  # (B, h_dim)
+
+        z_sys = layers.Dense(
+            L // 2,
+            name="z_sys",
+            kernel_regularizer=regularizers.l2(REG)
+        )(sys_latent)
+
     else:
-        z_sys = layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], L // 2)), name="z_sys")(inputs_sys)
-    
-# --- Branch B: NVIDIA-style FNO Encoder (Residual Path) ---
-    # 1. Lifting Layer: Maps raw dead features to latent space
-    x_fno = fno_lifting(inputs_res, config.get("hnn_feature_dim", 256))
-    
-    # 2. Iterative Spectral Convolutions
+        z_sys = layers.Lambda(
+            lambda x: tf.zeros((tf.shape(x)[0], L // 2)),
+            name="z_sys"
+        )(inputs_sys)
+
+
+    # ==================================================
+    # Branch B: FNO Residual Encoder (unchanged)
+    # ==================================================
+    x_fno = fno_lifting(inputs_res, dim)
+
     for _ in range(config.get("fno_blocks", 4)):
-        x_fno = fno_block(x_fno, h_dim, modes=f_modes)
-    
-    # 3. Final Latent Projection (Developing the Joint Manifold)
+        x_fno = fno_block(x_fno, dim, modes=f_modes)
+
     x_fno = layers.GlobalAveragePooling1D()(x_fno)
-    z_res = layers.Dense(L // 2, name="z_res")(x_fno)
-    
+
+    z_res = layers.Dense(
+        L // 2,
+        name="z_res",
+        kernel_regularizer=regularizers.l2(REG)
+    )(x_fno)
+
+    # ==================================================
+    # Joint Latent
+    # ==================================================
     z_combined = layers.Concatenate(name="z_combined")([z_sys, z_res])
-    return models.Model([inputs_sys, inputs_res], [z_sys, z_res, z_combined])
+
+    return models.Model(
+        inputs=[inputs_sys, inputs_res],
+        outputs=[z_sys, z_res, z_combined],
+        name="DualAnchor_MambaFNO_Encoder"
+    )
+
 
 
 def build_dual_decoder(feat_sys, feat_res, output_steps, config):
     L = config.get("latent_dim", 512)
-    h_dim = config.get("hnn_feature_dim", 256)
+    dim = config.get("mamba_dim", 256)
     f_modes = config.get("fno_modes", 8)
     drop_rate = config.get("dropout", 0.1)
-    
-    # Latent inputs from the joint manifold
+
+    # --------------------------------------------------
+    # Inputs
+    # --------------------------------------------------
     z_sys_in = layers.Input(shape=(L // 2,), name="z_sys_input")
     z_res_in = layers.Input(shape=(L // 2,), name="z_res_input")
-    
-    # --- DECODER A: Physics Path (Hamiltonian Reconstruction) ---
-    x_s = layers.Dense(output_steps * 64, activation='tanh', 
-                       kernel_regularizer=regularizers.l2(REG))(z_sys_in)
-    x_s = layers.Reshape((output_steps, 64))(x_s)
-    
-    if feat_sys > 0:
-        x_s = layers.Conv1D(feat_sys, 1, padding='same', 
-                        kernel_regularizer=regularizers.l2(REG))(x_s)
-        out_sys = layers.Activation('linear', name='out_phy')(x_s)
-    else:
-        # Safety for zero-physics feature cases
-        out_sys = layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], output_steps, 0)), 
-                                name='out_phy')(x_s) 
-    
-    # --- DECODER B: FNO Path (Residual/Dead Feature Reconstruction) ---
-    x_r = layers.Dense(output_steps * h_dim, activation='gelu',
-                       kernel_regularizer=regularizers.l2(REG))(z_res_in)
-    x_r = layers.Reshape((output_steps, h_dim))(x_r)
-    
-    # 2. Spectral Refinement: Reconstruct global frequency patterns
-    for i in range(config.get("fno_decoder_blocks", 2)):
-        x_r = fno_block(x_r, h_dim, modes=f_modes, dropout=drop_rate)
 
-    x_r = layers.Conv1D(feat_res, 1, padding='same', 
-                        kernel_regularizer=regularizers.l2(REG))(x_r)
-    out_res = layers.Activation('linear', name='out_res')(x_r)
-    
-    return models.Model([z_sys_in, z_res_in], [out_sys, out_res])
+    # ==================================================
+    # Decoder A: Consensus / Physics Reconstruction
+    # ==================================================
+    x_s = layers.Dense(
+        dim,
+        activation="gelu",
+        kernel_regularizer=regularizers.l2(REG)
+    )(z_sys_in)
+
+    x_s = layers.Dense(
+        dim,
+        activation="gelu",
+        kernel_regularizer=regularizers.l2(REG)
+    )(x_s)
+
+    x_s = layers.Dense(
+        output_steps * dim,
+        activation="gelu",
+        kernel_regularizer=regularizers.l2(REG)
+    )(x_s)
+
+    x_s = layers.Reshape((output_steps, dim))(x_s)
+
+    if feat_sys > 0:
+        out_sys = layers.Conv1D(
+            feat_sys,
+            kernel_size=1,
+            padding="same",
+            activation="linear",
+            kernel_regularizer=regularizers.l2(REG),
+            name="out_phy"
+        )(x_s)
+    else:
+        out_sys = layers.Lambda(
+            lambda x: tf.zeros((tf.shape(x)[0], output_steps, 0)),
+            name="out_phy"
+        )(x_s)
+
+    # ==================================================
+    # Decoder B: Residual / FNO Reconstruction
+    # ==================================================
+    x_r = layers.Dense(
+        dim,
+        activation="gelu",
+        kernel_regularizer=regularizers.l2(REG)
+    )(z_res_in)
+
+    x_r = layers.Dense(
+        output_steps * dim,
+        activation="gelu",
+        kernel_regularizer=regularizers.l2(REG)
+    )(x_r)
+
+    x_r = layers.Reshape((output_steps, dim))(x_r)
+
+    for _ in range(config.get("fno_decoder_blocks", 2)):
+        x_r = fno_block(x_r, dim, modes=f_modes, dropout=drop_rate)
+
+    x_r = layers.Conv1D(
+        feat_res,
+        kernel_size=1,
+        padding="same",
+        kernel_regularizer=regularizers.l2(REG)
+    )(x_r)
+
+    out_res = layers.Activation("linear", name="out_res")(x_r)
+
+    return models.Model(
+        inputs=[z_sys_in, z_res_in],
+        outputs=[out_sys, out_res],
+        name="DualAnchor_MambaFNO_Decoder"
+    )
+
 
 
 def build_discriminator(input_dim):
