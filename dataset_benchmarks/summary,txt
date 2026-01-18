@@ -1,0 +1,31 @@
+==================================================
+
+PSM_HNN_TCN (1 entities):
+  AUC:   0.7253
+  Fc1:   0.5424
+  PA%K:  0.4345
+
+SMD_HNN_TCN (28 entities):
+  AUC:   0.8192
+  Fc1:   0.7572
+  PA%K:  0.3303
+
+MSL_HNN_TCN (27 entities):
+  AUC:   0.6428
+  Fc1:   0.5847
+  PA%K:  0.3069
+
+PSM_HNN_FNO (1 entities):
+  AUC:   0.7790
+  Fc1:   0.5280
+  PA%K:  0.4345
+
+SMD_HNN_FNO (27 entities):
+  AUC:   0.8396
+  Fc1:   0.7579
+  PA%K:  0.3360
+
+MSL_HNN_FNO (27 entities):
+  AUC:   0.6371
+  Fc1:   0.5886
+  PA%K:  0.3079

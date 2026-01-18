@@ -50,14 +50,14 @@ files = {
     "MSL_HNN_FNO": "dataset_benchmarks/MSL_FNO.csv"
 }
 
-print("📊 Dual-Anchor Engine: Final Benchmark Summary")
+print("Summary")
 print("="*50)
 
 for name, path in files.items():
     result = calculate_fleet_averages(name, path)
     if result is not None:
         avg = result["means"]
-        print(f"\n🚀 {name} ({result['count']} entities):")
+        print(f"\n{name} ({result['count']} entities):")
         print(f"  AUC:   {avg['auc']:.4f}")
         print(f"  Fc1:   {avg['fc1']:.4f}")
         print(f"  PA%K:  {avg['pa_k_auc']:.4f}")
