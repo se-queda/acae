@@ -1,9 +1,10 @@
 import tensorflow as tf
 from tensorflow.keras import layers
 import numpy as np
+import math
+import pandas as pd
 
-# --- LATENT MIXING ---
-
+window_size= 100
 def mix_features(z_orig, z_other):
     """
     Interpolates between anchor and augmented latents for the discriminator task.
@@ -13,148 +14,103 @@ def mix_features(z_orig, z_other):
     z_mixed = alpha * z_orig + (1.0 - alpha) * z_other
     return z_mixed, alpha
 
-# --- UNIVARIATE PHYSICS MASKING ---
 
-def univariate_masker(data_windows, jerk_windows):
-    N, T, F = data_windows.shape
-    tiers = [95, 90, 85, 80]
+def create_windows(jerk):
+    T = len(jerk)
+    windows = []
+    
+    for start in range(0, T, window_size):
+        end = min(start+window_size, T)
+        windows.append(jerk[start:end])
+    return windows
+
+def calc_budget(jerk, tile):
+    threshold = np.percentile(jerk, tile)
+    count = np.sum(jerk > threshold)
+    budget = math.ceil(count/window_size)
+    if count> 0 and budget == 0:
+        budget = 1
+    return budget
+
+def project_to_time(mask_windows, Time):
+    time_mask = np.zeros(Time, dtype = bool)
+    
+    for w in mask_windows:
+        start = w * window_size
+        end = min(start + window_size, Time)
+        time_mask[start:end] = True
+    return time_mask
+
+def apply_mask(feature, time_mask):
+    masked_feature = feature.copy()
+    masked_feature[time_mask] = 0.0
+    return masked_feature
+        
+    
+def univariate_masker(feature, jerk, tile):
+    T = len(feature)
+    jerk_windows = create_windows(jerk)
+    jerk_window_mean =[w.mean() for w in jerk_windows]
+    rankedwindow = np.argsort(jerk_window_mean)[::-1]
+    budget = calc_budget(jerk, tile)
+    windows_to_mask = rankedwindow[:budget]
+    time_mask = project_to_time(
+        windows_to_mask,T
+    )
+    masked_feature = apply_mask(feature, time_mask)
+    
+    return masked_feature
+    
+def consensus_masker(data, masked_data, cluster_labels):
+    T, F = data.shape
+
+    data_np = data.values
+    masked_np = masked_data.values
+
+
+    data_windows = create_windows(data_np)       
+    masked_windows = create_windows(masked_np)   
+
+    final_windows = []
+    unique_clusters = np.unique(cluster_labels)
+
+    for w_masked, w_orig in zip(masked_windows, data_windows):
+        
+        w_consensus = w_masked.copy()
+        for c_id in unique_clusters:
+            c_indices = np.where(cluster_labels == c_id)[0]
+            feature_masked = np.all(
+                w_masked[:, c_indices] == 0.0,
+                axis=0
+            )  # 
+
+            if not np.all(feature_masked):
+                w_consensus[:, c_indices] = w_orig[:, c_indices]
+
+        final_windows.append(w_consensus)
+
+    consensus_np = np.vstack(final_windows)[:T]
+
+    return pd.DataFrame(consensus_np, columns=data.columns)
+
+def multivariate_masker(data, jerk, cluster_labels, use_consensus_masker = True):
+    if use_consensus_masker:
+        tiers = [95, 90, 85, 80]
+    else: 
+        tiers = [90]
+    
     views = []
-
-    # budgets[tier_idx, feature_idx] stores K for each tier/feature
-    budgets = np.zeros((len(tiers), F), dtype=int)
-    # sorted_indices[feature_idx] stores window indices sorted by jerk mean (ascending)
-    sorted_indices = np.zeros((F, N), dtype=int)
-
-    # --- Step 1: Pre-calculate Physics Stats per Feature ---
-    for f in range(F):
-        feat_jerk_wins = jerk_windows[:, :, f] # Shape: (N, T)
-        flat_jerk = feat_jerk_wins.flatten()
+    for tier in tiers:
+        masked_df = data.copy()
+        for col in data.columns:
+            signal = data[col].values
+            jerk_data = jerk[col].values
+            masked_df[col] = univariate_masker(signal,jerk_data, tier)
+        if use_consensus_masker:
+            consensus_df = consensus_masker(data , masked_df, cluster_labels)
+        else :
+            consensus_df = masked_df
         
-        # Calculate all 4 thresholds in one pass
-        thresholds = np.percentile(flat_jerk, tiers)
-        
-        for i, threshold in enumerate(thresholds):
-            count_above = np.sum(flat_jerk > threshold)
-            k = int(np.ceil(count_above / T))
-            # Safety: At least 1 window if any instability exists
-            if count_above > 0 and k == 0: k = 1
-            budgets[i, f] = k
-            
-        # Score every window once and sort them
-        window_means = np.mean(feat_jerk_wins, axis=1) # Shape: (N,)
-        sorted_indices[f] = np.argsort(window_means)
+        views.append(consensus_df)
+    return tuple(views)
 
-    # --- Step 2: Build the 4 Tiered Views ---
-    for i, p in enumerate(tiers):
-        v_tier = data_windows.copy() # Template for this tier
-        for f in range(F):
-            k = budgets[i, f]
-            if k > 0:
-                # Mask the top K 'jerkiest' windows using pre-sorted indices
-                # No Veto check here: if it's high jerk, it gets masked.
-                top_k_idx = sorted_indices[f][-k:]
-                v_tier[top_k_idx, :, f] = 0.0
-        views.append(v_tier)
-
-    return views[0], views[1], views[2], views[3]
-
-
-
-def consensus_masker(data_windows, jerk_windows, cluster_labels):
-    """
-    The Final Algorithm:
-    1. Runs the univariate masker for all 4 percentiles.
-    2. For each view and each window, checks for cluster-wide agreement.
-    3. If a masked feature's cluster isn't 100% masked, the whole cluster is unmasked.
-    """
-    # Step 1: Get the 4 percentile views from the univariate masker
-    base_views = univariate_masker(data_windows, jerk_windows)
-    
-    N, T, F = data_windows.shape
-    final_views = []
-
-    for v_tier in base_views:
-        # Pre-identify which (window, feature) pairs are masked (where data is zeroed)
-        # Shape: (N, F)
-        is_masked = np.all(v_tier == 0.0, axis=1)
-        
-        # Working copy for the consensus adjustments
-        v_consensus = v_tier.copy()
-
-        for n in range(N):
-            processed_clusters = set() # Track processed clusters for this window
-            
-            for f in range(F):
-                c_id = cluster_labels[f]
-                
-                # Skip if we already validated or vetoed this cluster in this window
-                if c_id in processed_clusters:
-                    continue
-                
-                # Check if this feature is masked
-                if is_masked[n, f]:
-                    # Find all features belonging to this cluster
-                    c_indices = np.where(cluster_labels == c_id)[0]
-                    
-                    # CONSENSUS CHECK: Are ALL features in this cluster masked?
-                    if np.all(is_masked[n, c_indices]):
-                        # Cluster consensus reached: keep the mask
-                        pass
-                    else:
-                        # VETO: Cluster does not agree. Unmask everyone in the group.
-                        v_consensus[n, :, c_indices] = data_windows[n, :, c_indices]
-                    
-                    # Mark this cluster as done for this window
-                    processed_clusters.add(c_id)
-        
-        final_views.append(v_consensus)
-
-    return tuple(final_views)
-
-# Point the main entry point to the new consensus logic
-get_masked_views = consensus_masker
-
-
-
-def resi_masker(data_windows, jerk_windows, p_tile=90):
-    """
-    Lone Wolf Specialist Masker:
-    Uses a single high-sensitivity tier (default 90th percentile)
-    to shred data windows where envelope jerk is peaking.
-    """
-    N, T, F = data_windows.shape
-    
-    # budgets[feature_idx] stores K (how many windows to mask)
-    budgets = np.zeros(F, dtype=int)
-    # sorted_indices[feature_idx] stores window indices sorted by jerk mean
-    sorted_indices = np.zeros((F, N), dtype=int)
-
-    # --- Step 1: Physical Budgeting ---
-    for f in range(F):
-        feat_jerk_wins = jerk_windows[:, :, f]
-        flat_jerk = feat_jerk_wins.flatten()
-        
-        # Calculate the specific 90th percentile threshold
-        threshold = np.percentile(flat_jerk, p_tile)
-        
-        count_above = np.sum(flat_jerk > threshold)
-        # Calculate budget K: How many windows-worth of samples are unstable?
-        k = int(np.ceil(count_above / T))
-        
-        if count_above > 0 and k == 0: k = 1
-        budgets[f] = k
-            
-        # Score windows by mean jerk
-        window_means = np.mean(feat_jerk_wins, axis=1)
-        sorted_indices[f] = np.argsort(window_means)
-
-    # --- Step 2: Apply Veto Masking ---
-    masked_view = data_windows.copy()
-    for f in range(F):
-        k = budgets[f]
-        if k > 0:
-            # Shred the top K jerkiest windows
-            top_k_idx = sorted_indices[f][-k:]
-            masked_view[top_k_idx, :, f] = 0.0
-
-    return masked_view

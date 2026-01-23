@@ -38,7 +38,7 @@ class DualAnchorACAETrainer:
         self.disc_metric = namespace.metrics.Mean(name="disc_mean")
         self.enc_metric = namespace.metrics.Mean(name="enc_mean")
 
-    @tf.function(jit_compile=True)
+    @tf.function()
     def _train_step(self, phy_packed, res_windows):
         # 1. Unpack Physics Views
         anchor_phy = phy_packed[:, 0, :, :]        
@@ -153,59 +153,6 @@ class DualAnchorACAETrainer:
                     if wait >= self.patience:
                         print(f"🛑 Early stopping at epoch {epoch+1}")
                         break
-
-    def reconstruct_errors(self, test_final, batch_size=128):
-        print("🔍 Generating Point-wise Reconstructions (streaming)...")
-        phy_views = tf.cast(test_final['phy'], tf.float32) 
-        res_data = tf.cast(test_final['res'], tf.float32)
-
-        # Determine anchor
-        phy_anchor = phy_views[:, 0, :, :] if len(phy_views.shape) == 4 else phy_views
-
-        has_phy = self.topo.idx_phy.shape[0] > 0
-        has_lone = len(self.topo.res_to_lone_local) > 0
-        has_dead = len(self.topo.res_to_dead_local) > 0
-
-        lone_idx = tf.constant(self.topo.res_to_lone_local, dtype=tf.int32) if has_lone else None
-        dead_idx = tf.constant(self.topo.res_to_dead_local, dtype=tf.int32) if has_dead else None
-
-        se_p_list, se_l_list, se_d_list = [], [], []
-        total = phy_anchor.shape[0]
-        if total is None:
-            total = int(tf.shape(phy_anchor)[0].numpy())
-
-        for i in range(0, total, batch_size):
-            p_batch = phy_anchor[i:i+batch_size]
-            r_batch = res_data[i:i+batch_size]
-            zs, zr, _ = self.encoder([p_batch, r_batch], training=False)
-            ph, rh = self.decoder([zs, zr], training=False)
-
-            if has_phy:
-                se_p = tf.reduce_mean(tf.square(p_batch - ph), axis=-1)
-            else:
-                se_p = tf.zeros([tf.shape(p_batch)[0], tf.shape(p_batch)[1]], dtype=tf.float32)
-            se_p_list.append(se_p.numpy())
-
-            if has_lone:
-                r_l = tf.gather(r_batch, lone_idx, axis=-1)
-                rh_l = tf.gather(rh, lone_idx, axis=-1)
-                se_l = tf.reduce_mean(tf.square(r_l - rh_l), axis=-1)
-            else:
-                se_l = tf.zeros([tf.shape(r_batch)[0], tf.shape(r_batch)[1]], dtype=tf.float32)
-            se_l_list.append(se_l.numpy())
-
-            if has_dead:
-                r_d = tf.gather(r_batch, dead_idx, axis=-1)
-                se_d = tf.reduce_mean(tf.square(r_d), axis=-1)
-            else:
-                se_d = tf.zeros([tf.shape(r_batch)[0], tf.shape(r_batch)[1]], dtype=tf.float32)
-            se_d_list.append(se_d.numpy())
-
-        return {
-            "se_p": np.concatenate(se_p_list, axis=0),
-            "se_l": np.concatenate(se_l_list, axis=0),
-            "se_d": np.concatenate(se_d_list, axis=0)
-        }
                     
     def reconstruct(self, test_final, batch_size=128):
         print("🔍 Generating Point-wise Reconstructions...")

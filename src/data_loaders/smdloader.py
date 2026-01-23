@@ -17,7 +17,7 @@ def load_smd_windows(data_root, machine_id, config):
     savgol_poly = config['savgol_poly']
     sparsity = config['sparsity_factor']
 
-    print(f"🚀 Dual-Anchor Pipeline Initiated: {machine_id}")
+    print(f" Dual-Anchor Pipeline Initiated: {machine_id}")
     
     # 1. Loading & Scaling [cite: 234, 273]
     train_raw = load_txt_file(os.path.join(data_root, "train", f"{machine_id}.txt"))
@@ -81,3 +81,7 @@ def load_smd_windows(data_root, machine_id, config):
     test_labels = test_labels[:actual_test_len]
 
     return train_final, test_final, test_labels, scaler.mean_, scaler.scale_
+
+
+
+def load_smd_windiw
