@@ -22,7 +22,7 @@ global_config = {
     "recon_weight": 1.0,    # reconstruction
     "lambda_mom": 0.5,      # momentum
     "alpha_vpo": 150.0,     # Hamiltonian penalty
-    "sentinel_weight": 10.0, #dead sensor penalty
+    "sentinel_weight": 1.0, #dead sensor penalty
 
     # --- Training ---
     "epochs": 20,
