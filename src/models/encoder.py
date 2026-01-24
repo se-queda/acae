@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fno import FNOencoder
-from hnn import HNN
+from .fno import FNOencoder
+from .hnn import HNN
 
 class TCNResidualBlock(nn.Module):
     def __init__(self, feat_phy, hnn_dim, kernel_size, dilation, dropout=0.1):
@@ -93,7 +93,7 @@ class DualEncoder(nn.Module):
         self.HNNlayer = HNN(hnn_dim, integration_steps, dt)
         self.HNNProj = TCN(feat_phy, hnn_dim)
         
-        self.dense1 = nn.Linear(hnn_dim, hnn_dim)
+        self.dense1 = nn.Linear(2*hnn_dim, hnn_dim)
         self.dense2 = nn.Linear(hnn_dim, hnn_dim)
         self.drop = nn.Dropout(0.01)
         
@@ -111,7 +111,6 @@ class DualEncoder(nn.Module):
             z_phy = torch.tanh(z_phy)
             z_phy = self.drop(z_phy)
             z_phy = self.dense2(z_phy)
-            z_phy = z_phy.mean(dim=2) 
         else:
             z_phy = torch.zeros(
                 B, self.hnn_dim,

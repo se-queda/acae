@@ -46,9 +46,8 @@ class FNOdecoder(nn.Module):
         
         self.proj = nn.Linear(fno_dim, fno_dim * output_steps)
         # Latent-space FNO propagation
-        self.fno = fno.FNO1DDecoder(
+        self.fno = fno.FNO1DEncoder(
             in_channels=fno_dim,
-            out_channels=fno_dim,
             num_fno_layers=fno_blocks,
             fno_layer_size=fno_dim,
             num_fno_modes=f_modes,
@@ -67,7 +66,7 @@ class FNOdecoder(nn.Module):
         z = self.fno(z)
         out = self.out(z)
         
-        return out.permute(0,2,1)
+        return out
 
 
 #output : Batch, feature_reconstructed(feat_res), time_steps_reconstructed

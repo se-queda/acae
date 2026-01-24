@@ -1,27 +1,31 @@
 
-from models import DualEncoder as encoder
-from models import DualDecoder as decoder
-from models import Discriminator as discriminator
+from src.models import DualEncoder as encoder
+from src.models import DualDecoder as decoder
+from src.models import Discriminator as discriminator
 from fno_config import fno_config
 from hnn_config import hnn_config
 from global_config import global_config
 
-from masking import mix_features
-from losses import discriminator_loss, encoder_loss
+from src.masking import mix_features
+from src.losses import discriminator_loss, encoder_loss
 
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-import tqdm
+from tqdm import tqdm
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+
 
 class DualAnchorACAETrainer:
-    def __init__(self, encoder, decoder, discriminator, config, topology):
+    def __init__(self, encoder, decoder, discriminator, hnn_config, fno_config, global_config, topology):
 
         self.topo = topology 
-        
+        self.hnn_config = hnn_config
+        self.fno_config = fno_config
+        self.global_config = global_config
         #sensor numbers
         self.num_phy_sensors = topology.num_phy_sensors
         self.num_res_sensors = topology.num_res_sensors
@@ -43,12 +47,12 @@ class DualAnchorACAETrainer:
         
         # Training hyperparameters
         self.lr = global_config['learning_rate']
-        self.patience = global_config.get('patience', 20)
-        self.recon_weight = global_config.get('recon_weight', 1.0)
-        self.lambda_d = global_config.get('lambda_d', 1.0)
-        self.lambda_e = global_config.get('lambda_e', 1.0)
-        self.sentinel_weight = global_config.get('sentinel_weight', 10.0)
-        self.alpha_vpo = global_config.get('alpha_vpo', 150.0)
+        self.patience = global_config.get('patience')
+        self.recon_weight = global_config.get('recon_weight')
+        self.lambda_d = global_config.get('lambda_d')
+        self.lambda_e = global_config.get('lambda_e')
+        self.sentinel_weight = global_config.get('sentinel_weight')
+        self.alpha_vpo = global_config.get('alpha_vpo')
         self.window_size = global_config['window_size']
 
         # Model Initialization
@@ -86,6 +90,10 @@ class DualAnchorACAETrainer:
         self.debug = True
         if self.debug:
             print("✅ Using Device:", self.device)
+            
+            
+        #tensorboard
+        self.writer = SummaryWriter(log_dir="runs/dual_anchor_acae")
 
     
     def train_step(self, phy_packed, res_windows):
@@ -121,7 +129,7 @@ class DualAnchorACAETrainer:
     #   - sentinel
     # ===============================
         j_abs = torch.abs(jerk_phy)
-        jerk_thres = torch.mean(j_abs) + torch.std(j_abs)
+        jerk_thres = torch.mean(j_abs) + torch.std(j_abs) + 1e-6 
         vpo_weights = torch.where(j_abs>jerk_thres, torch.full_like(j_abs, self.alpha_vpo), torch.ones_like(j_abs))
         
         
@@ -133,9 +141,9 @@ class DualAnchorACAETrainer:
         recon_res_loss = torch.mean(F.mse_loss(res_windows, recons_res, reduction='none'))
         
         if(len(self.topo.res_to_dead_local) > 0):
-            dead_idx = torch.tensor(self.topo.read_dead_local, dtype=torch.long, device=self.device)
+            dead_idx = torch.tensor(self.topo.res_to_dead_local, dtype=torch.long, device=self.device)
             dead_recons = recons_res[:, dead_idx, :]
-            sentinel_loss = sentinel_loss = F.mse_loss(dead_recons, torch.zeros_like(dead_recons))
+            sentinel_loss = F.mse_loss(dead_recons, torch.zeros_like(dead_recons))
 
         else:
             sentinel_loss = torch.tensor(0.0, device=self.device)
@@ -209,6 +217,10 @@ class DualAnchorACAETrainer:
     # ===============================
     # 8. Return scalars
     # ===============================
+        if self.debug:
+            assert not torch.isnan(total_loss)
+            assert not torch.isnan(loss_disc)
+
         return {
             "total_loss": total_loss.detach(),
             "recon_phy": recon_phy_loss.detach(),
@@ -217,82 +229,252 @@ class DualAnchorACAETrainer:
             "loss_disc": loss_disc.detach(),
             "loss_enc": loss_enc.detach(),
         }
+    
+    
+    def save_checkpoint(self, epoch, best_val_loss, path="checkpoint.pt"):
+        torch.save({
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "encoder": self.encoder.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "discriminator": self.discriminator.state_dict(),
+            "enc_dec_optimizer": self.enc_dec_optimizer.state_dict(),
+            "disc_optimizer": self.disc_optimizer.state_dict(),
+        }, path)
 
-
+    
+    
     def fit(self, train_ds, val_ds=None, epochs=200):
         best_val_loss = float("inf")
-        wait = 0 
+        wait = 0
+        
         
         for epoch in range(epochs):
-            self.recon_metric.reset_state()
-            self.disc_metric.reset_state()
-            self.enc_metric.reset_state()
             
-            bar = tqdm(train_ds, desc=f"Epoch {epoch+1}", unit="batch")
+            #Train
+            self.encoder.train()
+            self.decoder.train()
+            self.discriminator.train()
+            
+            
+            epoch_recon = 0.0
+            epoch_disc = 0.0
+            epoch_enc = 0.0
+            num_batches = 0
+            
+            bar = tqdm(train_ds, desc = f"{epoch+1}", unit = 'batch')
             for phy_batch, res_batch in bar:
-                r_loss, d_loss, e_loss = self._train_step(phy_batch, res_batch)
-                self.recon_metric.update_state(r_loss)
-                self.disc_metric.update_state(d_loss)
-                self.enc_metric.update_state(e_loss)
                 
-                bar.set_postfix({"Recon": f"{r_loss:.4f}", "Disc": f"{d_loss:.4f}"})
+                out = self.train_step(phy_batch, res_batch)
+                recon_loss = out["recon_phy"] + out["recon_res"] + out["sentinel"]
+                disc_loss  = out["loss_disc"]
+                enc_loss   = out["loss_enc"]
+                
+                epoch_recon += recon_loss.item()
+                epoch_disc  += disc_loss.item()
+                epoch_enc   += enc_loss.item()
+                num_batches += 1
+                
+                bar.set_postfix(
+                    {
+                        "Recon":f"{epoch_recon/num_batches:.4f}",
+                        "Disc": f"{epoch_disc/num_batches:.4f}",
+                        "enc": f"{epoch_enc/num_batches:.4f}"
+                    }
+                )
+            self.writer.add_scalar("train/recon_loss", epoch_recon / num_batches, epoch)
+            self.writer.add_scalar("train/disc_loss",  epoch_disc  / num_batches, epoch)
+            self.writer.add_scalar("train/enc_loss",   epoch_enc   / num_batches, epoch)
 
+                    
+            #validation
             if val_ds is not None:
+                self.encoder.eval()
+                self.decoder.eval()
+
                 val_losses = []
-                for v_phy, v_res in val_ds:
-                    # 1. Forward Pass (No training)
-                    v_phy_anchor = v_phy[:, 0, :, :] 
-                    z_s, z_r, _ = self.encoder([v_phy_anchor, v_res], training=False)
-                    h_phy, h_res = self.decoder([z_s, z_r], training=False)
-                    
-                    # 2. FIXED: Calculate MSE for each branch separately to avoid shape broadcast errors
-                    mse_phy = tf.reduce_mean(tf.square(v_phy_anchor - h_phy))
-                    mse_res = tf.reduce_mean(tf.square(v_res - h_res))
-                    
-                    # 3. Add the scalars together
-                    val_losses.append((mse_phy + mse_res).numpy())
-                
+
+                with torch.no_grad():
+                    for v_phy, v_res in val_ds:
+                        v_phy = v_phy.to(self.device)
+                        v_res = v_res.to(self.device)
+
+                        anchor = v_phy[:, 0]  # (B, C, T)
+
+                        z_comb = self.encoder(anchor, v_res)
+                        z_sys  = z_comb[:, :self.hnn_dim]
+                        z_res  = z_comb[:, self.hnn_dim:]
+
+                        h_phy, h_res = self.decoder(z_sys, z_res)
+
+                        mse_phy = F.mse_loss(anchor, h_phy)
+                        mse_res = F.mse_loss(v_res, h_res)
+
+                        val_losses.append((mse_phy + mse_res).item())
+
                 current_val_loss = float(np.mean(val_losses))
-                print(f"✅ Val MSE: {current_val_loss:.4f} | Best: {best_val_loss:.4f}")
+                tqdm.write(
+                    f"Val MSE: {current_val_loss:.4f} | Best: {best_val_loss:.4f}"
+                )
                 
-                if current_val_loss < best_val_loss:
-                    best_val_loss, wait = current_val_loss, 0
+                self.writer.add_scalar("val/mse", current_val_loss, epoch)
+
+                if(current_val_loss<best_val_loss):
+                    best_val_loss = current_val_loss
+                    wait = 0
+                    self.save_checkpoint(epoch, best_val_loss)
+                    tqdm.write("best models saved")
                 else:
-                    wait += 1
-                    if wait >= self.patience:
-                        print(f"🛑 Early stopping at epoch {epoch+1}")
+                    wait +=1
+                    if(wait>=self.patience):
+                        tqdm.write(f"early stopping {epoch+1}")
                         break
-                    
+
+        
+        
+        
     def reconstruct(self, test_final, batch_size=128):
         print("🔍 Generating Point-wise Reconstructions...")
-        phy_views = tf.cast(test_final['phy'], tf.float32) 
-        res_data  = tf.cast(test_final['res'], tf.float32)
-        
-        # Determine anchor
-        phy_anchor = phy_views[:, 0, :, :] if len(phy_views.shape) == 4 else phy_views
 
-        # Batched inference to prevent GPU OOM
+        phy_views = test_final["phy"].float().to(self.device)
+        res_data  = test_final["res"].float().to(self.device)
+
+        # Determine anchor view
+        if phy_views.dim() == 4:   # (B, V, C, T)
+            phy_anchor = phy_views[:, 0]   # (B, C, T)
+        else:
+            phy_anchor = phy_views         # already (B, C, T)
+        self.encoder.eval()
+        self.decoder.eval()
+        
+        for p in self.encoder.parameters():
+            p.requires_grad_(False)
+        for p in self.decoder.parameters():
+            p.requires_grad_(False)
+        # Batched encoding
         z_sys_list, z_res_list = [], []
-        for i in range(0, len(phy_anchor), batch_size):
-            p_batch = phy_anchor[i:i+batch_size]
-            r_batch = res_data[i:i+batch_size]
-            zs, zr, _ = self.encoder([p_batch, r_batch], training=False)
-            z_sys_list.append(zs)
-            z_res_list.append(zr)
-        
-        z_sys = tf.concat(z_sys_list, axis=0)
-        z_res = tf.concat(z_res_list, axis=0)
-        
+        with torch.enable_grad():  # CHANGED: HNN uses autograd.grad, so encoding needs grads enabled.
+            for i in range(0, phy_anchor.size(0), batch_size):
+                p_batch = phy_anchor[i:i + batch_size]
+                r_batch = res_data[i:i + batch_size]
+                z_comb = self.encoder(p_batch, r_batch)
+                z_sys  = z_comb[:, :self.hnn_dim]
+                z_res  = z_comb[:, self.hnn_dim:]
+                z_sys_list.append(z_sys.detach())  # CHANGED: detach to keep recon deterministic and avoid graph growth.
+                z_res_list.append(z_res.detach())  # CHANGED: detach to keep recon deterministic and avoid graph growth.
+            z_sys = torch.cat(z_sys_list, dim=0)
+            z_res = torch.cat(z_res_list, dim=0)
+
         # Batched decoding
         phy_hat_list, res_hat_list = [], []
-        for i in range(0, len(z_sys), batch_size):
-            ph, rh = self.decoder([z_sys[i:i+batch_size], z_res[i:i+batch_size]], training=False)
-            phy_hat_list.append(ph)
-            res_hat_list.append(rh)
-            
+        with torch.no_grad():  # CHANGED: decoding does not need gradients.
+            for i in range(0, z_sys.size(0), batch_size):
+                ph, rh = self.decoder(
+                    z_sys[i:i + batch_size],
+                    z_res[i:i + batch_size]
+                )
+                phy_hat_list.append(ph)
+                res_hat_list.append(rh)
+            phy_hat = torch.cat(phy_hat_list, dim=0)
+            res_hat = torch.cat(res_hat_list, dim=0)
+
+
         return {
-            "phy_orig": phy_anchor.numpy(),
-            "phy_hat": tf.concat(phy_hat_list, axis=0).numpy(),
-            "res_orig": res_data.numpy(),
-            "res_hat": tf.concat(res_hat_list, axis=0).numpy()
+            "phy_orig": phy_anchor.cpu().numpy(),
+            "phy_hat":  phy_hat.cpu().numpy(),
+            "res_orig": res_data.cpu().numpy(),
+            "res_hat":  res_hat.cpu().numpy(),
         }
+
+
+    
+    
+    #Pipeline checker functions, not used while training with real data, only used during model debug.
+
+
+    def _make_dummy_batch(self, B=8):
+        """
+        Creates a single dummy batch matching trainer expectations.
+        """
+
+        T = self.window_size
+        C_phy = self.topo.num_phy_features
+        C_res = self.topo.num_res_features
+        V = 6  # anchor + 4 aug + jerk
+
+        # Physics views: (B, V, C_phy, T)
+        phy = torch.randn(B, V, C_phy, T, device=self.device)
+
+        # Residual windows: (B, C_res, T)
+        res = torch.randn(B, C_res, T, device=self.device)
+
+        return phy, res
+
+    def debug_sanity_check(self):
+        print("🧪 Running full sanity check...")
+
+        phy, res = self._make_dummy_batch(B=4)
+
+        # ---- train_step ----
+        out = self.train_step(phy, res)
+
+        print("✅ train_step outputs:")
+        for k, v in out.items():
+            print(f"  {k}: {float(v):.6f}")
+
+        # ---- reconstruct ----
+        dummy_test = {
+            "phy": phy[:, :1],   # fake anchor-only input
+            "res": res
+        }
+
+        recon = self.reconstruct(dummy_test, batch_size=2)
+
+        print("reconstruct outputs:")
+        for k, v in recon.items():
+            print(f"  {k}: shape = {v.shape}")
+
+        print("successfull")
+
+
+
+
+#dummy topology and dummy checker script.
+
+'''
+# DUMMY TOPOLOGY
+
+topology = type("Topology", (), {})()
+
+# global sensor indices
+topology.idx_phy  = np.array([0, 1, 2, 3])        # 4 physics sensors
+topology.idx_res  = np.array([0, 1, 2, 3, 4, 5])  # 6 residual sensors
+
+# no dead / lone sensors for now
+topology.idx_dead = np.array([])
+topology.idx_lone = np.array([])
+
+# local mappings (empty → sentinel disabled cleanly)
+topology.res_to_dead_local = []
+topology.res_to_lone_local = []
+
+# counts (trainer relies on these)
+topology.num_phy_features = len(topology.idx_phy)
+topology.num_res_features = len(topology.idx_res)
+
+# aliases used elsewhere
+topology.num_phy_sensors = topology.num_phy_features
+topology.num_res_sensors = topology.num_res_features
+
+trainer = DualAnchorACAETrainer(
+    encoder,
+    decoder,
+    discriminator,
+    hnn_config,
+    fno_config,
+    global_config,
+    topology
+)
+
+trainer.debug_sanity_check()
+'''

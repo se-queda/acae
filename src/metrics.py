@@ -30,19 +30,9 @@ def compute_auc(scores, labels):
     return roc_auc_score(labels, scores)
 
 
-# ----------------------------------------------------------------------
+
 # Fc1: Composite F-score (Garg et al., 2021)
-# ----------------------------------------------------------------------
 def compute_fc1(preds, labels):
-    """
-    Composite F-score (Fc1) implementation.
-
-    - Event-wise recall: fraction of ground-truth anomalous segments
-      that intersect with at least one predicted positive point.
-    - Time-wise precision: point-wise precision over all time steps.
-
-    Fc1 = 2 * (event_recall * time_precision) / (event_recall + time_precision)
-    """
 
     labels = np.asarray(labels).astype(int)
     preds = np.asarray(preds).astype(int)
@@ -51,7 +41,6 @@ def compute_fc1(preds, labels):
     # ---- Event-wise recall ----
     segments = _segments_from_labels(labels)
     if len(segments) == 0:
-        # No anomalies in ground truth; Fc1 defined as 0 here
         return 0.0
 
     detected_segments = 0
@@ -61,7 +50,6 @@ def compute_fc1(preds, labels):
             detected_segments += 1
 
     event_recall = detected_segments / len(segments)
-
     # ---- Time-wise precision ----
     tp = np.sum((preds == 1) & (labels == 1))
     fp = np.sum((preds == 1) & (labels == 0))

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
-from torch.autograd as grad
+from torch.autograd import grad
 from typing import Tuple, Optional
 import math
 
@@ -37,7 +37,10 @@ class HNN(nn.Module):
     def forward(self, x):
     # x: (B, T, D)
         q = x[:, :, -1]             # (B, D)
-        p = x[:, :, -1] - x[:, :, -2]         # (B, D)
+        p = x[:, :, -1] - x[:, :, -2]   
+        
+        q = q.detach().requires_grad_(True)
+        p = p.detach().requires_grad_(True)# (B, D)
 
         for _ in range(self.steps):
             dq, dp = self.get_gradients(q, p)
@@ -76,10 +79,10 @@ class HNNdecoder(nn.Module):
         if(self.feat_phy > 0):
 
             out = self.conv(z)
-            out = out.permute(0,2,1)
+            out = out
             out = self.linear_activation(out)
         else:
-            out = torch.zeros((B, self.output_steps, 0), device = x.device)
+            out = torch.zeros((B, 0, self.output_steps), device = x.device)
         return out
 
 #output : Batch, feature_reconstructed(feat_phy), time_steps_reconstructed

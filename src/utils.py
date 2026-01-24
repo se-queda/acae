@@ -6,6 +6,8 @@ from scipy.signal import savgol_filter
 from scipy.interpolate import CubicSpline
 from sklearn.preprocessing import StandardScaler
 
+import matplotlib.pyplot as plt
+
 # Internal imports
 from .masking import get_masked_views, resi_masker
 from .router import route_features
@@ -45,35 +47,72 @@ def create_spline_envelopes(data, window_size, sparsity_factor):
     return cs_upper(x_new), cs_lower(x_new)
 
 
-def build_tf_datasets(train_final, test_final, val_split=0.2, batch_size=128):
-    """Synchronized TF pipeline for Dual-Anchor branches."""
-    # FIXED: Key was 'res_windows', now 'res_views' to match load_smd_windows
-    phy_data = train_final['phy_views']   
-    res_data = train_final['res_views'] 
-    num_samples = len(phy_data)
+def create_windows(data, current_stride):
+    """
+    Input:
+        data : np.ndarray (C, T)
+    Output:
+        windows : np.ndarray (W, C, T)
+    """
+    C, T = data.shape
+    num_windows = (T - window) // current_stride + 1
 
-    num_train = int(num_samples * (1 - val_split))
-    indices = np.arange(num_samples)
-    np.random.shuffle(indices)
+    return np.array(
+        [
+            data[:, i * current_stride : i * current_stride + window]
+            for i in range(num_windows)
+        ],
+        dtype=np.float32,
+    )
+
     
-    train_idx = indices[:num_train]
-    val_idx = indices[num_train:]
     
-    train_phy, train_res = phy_data[train_idx], res_data[train_idx]
-    val_phy, val_res = phy_data[val_idx], res_data[val_idx]
-    
-    test_phy, test_res = test_final['phy'], test_final['res']
 
-    AUTOTUNE = tf.data.AUTOTUNE
 
-    def make_dataset(phy, res, shuffle=False):
-        ds_phy = tf.data.Dataset.from_tensor_slices(phy)
-        ds_res = tf.data.Dataset.from_tensor_slices(res)
-        ds = tf.data.Dataset.zip((ds_phy, ds_res))
-        if shuffle:
-            ds = ds.cache().shuffle(2048)
-        return ds.batch(batch_size).prefetch(AUTOTUNE)
+def plot_reconstruction(
+    original,
+    reconstructed,
+    labels=None,
+    channel=0,
+    title=None,
+    figsize=(14, 4)
+):
+    """
+    Plot original vs reconstructed time series for visual inspection.
 
-    return (make_dataset(train_phy, train_res, shuffle=True), 
-            make_dataset(val_phy, val_res), 
-            make_dataset(test_phy, test_res))
+    Args:
+        original (array): shape (T,) or (C, T)
+        reconstructed (array): same shape as original
+        labels (array, optional): anomaly labels (T,)
+        channel (int): channel index if multivariate
+        title (str, optional): plot title
+    """
+    orig = np.asarray(original)
+    recon = np.asarray(reconstructed)
+
+    # Handle multivariate
+    if orig.ndim == 2:
+        orig = orig[channel]
+        recon = recon[channel]
+
+    T = len(orig)
+    t = np.arange(T)
+
+    plt.figure(figsize=figsize)
+    plt.plot(t, orig, label="Original", linewidth=2)
+    plt.plot(t, recon, label="Reconstruction", linestyle="--")
+
+    # Overlay anomaly regions if provided
+    if labels is not None:
+        labels = np.asarray(labels)
+        for i in range(T):
+            if labels[i] == 1:
+                plt.axvspan(i - 0.5, i + 0.5, color="red", alpha=0.05)
+
+    plt.xlabel("Time")
+    plt.ylabel("Value")
+    plt.legend()
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.show()

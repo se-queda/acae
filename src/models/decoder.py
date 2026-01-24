@@ -1,18 +1,18 @@
 import torch
 import torch.nn as nn
-from fno import FNOdecoder
-from hnn import HNNdecoder
+from .fno import FNOdecoder
+from .hnn import HNNdecoder
 
 
 #input: Batch, [res_latent: (B, fno_dim), phy_latent: (B, hnn_dim)]
 class DualDecoder(nn.Module):
-    def __init__(self, hnn_dim, fno_dim, feat_phy, feat_res, f_modes, fno_blocks, window_size, integration_steps, dt):
+    def __init__(self, hnn_dim, fno_dim, feat_phy, feat_res, f_modes, fno_blocks, output_steps):
         super().__init__()
         self.feat_phy = feat_phy
         self.hnn_dim = hnn_dim
         
-        self.FNOdecoder = FNOdecoder(feat_res, fno_dim, f_modes, fno_blocks, output_steps = window_size)
-        self.HNNdecoder = HNNdecoder(feat_phy, hnn_dim, output_steps = window_size)
+        self.FNOdecoder = FNOdecoder(feat_res, fno_dim, f_modes, fno_blocks, output_steps = output_steps)
+        self.HNNdecoder = HNNdecoder(feat_phy, hnn_dim, output_steps = output_steps)
         
         
         

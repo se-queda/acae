@@ -82,6 +82,7 @@ def route_features(train_data, test_data, dist_threshold=0.5):
     is_consensus = np.isin(labels, consensus_ids)
 
     phy_cluster_labels = labels[is_consensus]
+    res_labels = labels[is_consensus == False]
     idx_phy = idx_active[is_consensus]
     idx_lone = idx_active[~is_consensus]
 
@@ -94,4 +95,4 @@ def route_features(train_data, test_data, dist_threshold=0.5):
     train_phy, train_res = train_data[:, idx_phy], train_data[:, idx_res]
     test_phy, test_res = test_data[:, idx_phy], test_data[:, idx_res]
 
-    return (train_phy, train_res, test_phy, test_res), topo, phy_cluster_labels
+    return (train_phy, train_res, test_phy, test_res), topo, phy_cluster_labels, res_labels
