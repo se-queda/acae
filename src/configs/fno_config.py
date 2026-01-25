@@ -1,9 +1,8 @@
-fno_config = 
-{
+fno_config = {
     # dimensions
     "fno_dim": 256,
 
     # spectral params
-    "modes": 16,
-    "blocks": 4
+    "f_modes": 16,
+    "fno_blocks": 4
 }

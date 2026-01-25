@@ -7,7 +7,8 @@ global_config = {
     "val_split": 0.2,
 
     # --- Optimizer ---
-    "lr": 1e-4,  # learning rate
+    "lr": 1e-4,  # learning rate (legacy key)
+    "learning_rate": 1e-4,
 
     # --- Preprocessing ---
     "savgol_len": 11,
@@ -32,4 +33,3 @@ global_config = {
     "dataset": "SMD",
     "data_root": "/home/utsab/Downloads/smd/ServerMachineDataset/",
 }
-

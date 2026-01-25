@@ -5,35 +5,36 @@ import csv
 import numpy as np
 import gc
 from sklearn.metrics import precision_recall_fscore_support
-from tensorflow.keras import backend as K
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import multiprocessing as mp
 import traceback
 
 from src.trainer import DualAnchorACAETrainer
-from src.models import build_dual_encoder, build_dual_decoder, build_discriminator
-from src.utils import build_tf_datasets
+from src.models import DualEncoder, DualDecoder, Discriminator
+from src.utils import plot_reconstruction
+from src.dataset_builder import dataloader
 from src.metrics import compute_auc, compute_fc1, compute_pa_k_auc
 from src.data_loaders.psmloader import load_psm_windows
 from src.data_loaders.smdloader import load_smd_windows
-from src.data_loaders.smaploader import load_smap_windows
-from src.data_loaders.msloader import load_msl_windows
+
+from src.configs.fno_config import fno_config
+from src.configs.hnn_config import hnn_config
+from src.configs.global_config import global_config
 
 
-def load_config(path):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+
 
 def get_best_metrics(scores, labels, step_size=100):
-    """
-    Finds optimal thresholds for all evaluation philosophies. [cite: 489, 516]
-    """
+    
+    #Finds optimal thresholds for all evaluation philosophies. 
     scores = np.asarray(scores, dtype=float)
     labels = np.asarray(labels).astype(int)
     min_score, max_score = np.min(scores), np.max(scores)
     
     if min_score == max_score:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     thresholds = np.linspace(min_score, max_score, step_size)
     
@@ -43,13 +44,17 @@ def get_best_metrics(scores, labels, step_size=100):
     best_f1_pa = 0.0       
     best_prec_std = 0.0
     best_recall_std = 0.0
+    best_qeds = 0.0   
 
-    from src.metrics import _point_adjustment_at_k, _f1_from_preds
-
+    from src.metrics import (
+        _point_adjustment_at_k,
+        _f1_from_preds,
+        compute_qeds         
+    )
     for thresh in thresholds:
         preds = (scores > thresh).astype(int)
         
-        # 1. Paper Specific Metrics (Strict) [cite: 511, 514]
+        # 1. Fc1
         current_fc1 = compute_fc1(preds, labels)
         if current_fc1 > best_fc1:
             best_fc1 = current_fc1
@@ -58,7 +63,7 @@ def get_best_metrics(scores, labels, step_size=100):
         if current_pa_auc > best_pa_auc:
             best_pa_auc = current_pa_auc
             
-        # 2. Standard Point-wise (No Adjustment)
+        # 2. Standard Point-wise
         prec, rec, f1_std, _ = precision_recall_fscore_support(
             labels, preds, average='binary', zero_division=0
         )
@@ -67,35 +72,41 @@ def get_best_metrics(scores, labels, step_size=100):
             best_prec_std = prec
             best_recall_std = rec
 
-        # 3. Classic SOTA Point-Adjusted (Generous) [cite: 515]
+        #Point-Adjusted 
         adjusted_preds = _point_adjustment_at_k(preds, labels, K=0.0001) 
         f1_pa = _f1_from_preds(adjusted_preds, labels)
         if f1_pa > best_f1_pa:
             best_f1_pa = f1_pa
 
-    return best_fc1, best_pa_auc, best_f1_std, best_f1_pa, best_prec_std, best_recall_std
+        #Early Detection (
+        current_qeds = compute_qeds(preds, labels)
+        if current_qeds > best_qeds:
+            best_qeds = current_qeds
+
+    return (best_fc1,best_pa_auc,best_f1_std,best_f1_pa,best_prec_std,best_recall_std,best_qeds)
+
 
 def train_on_machine(machine_id, config):
     dataset_type = config.get("dataset", "SMD").upper()
     print(f"\n🚀 Dual-Anchor Engine Deployment [{dataset_type}]: {machine_id}")
 
     # Standardized Parameters
-    W = config["window_size"] 
-    BS = config["batch_size"] 
-    VS = config["val_split"]  
-    EP = config["epochs"]     
-    L = config["latent_dim"]  
-    stride = config["stride"]
+    W = global_config["window_size"]
+    BS = global_config["batch_size"]
+    VS = global_config["val_split"]
+    EP = global_config["epochs"]
+    stride = global_config["stride"]
+    hnn_dim = hnn_config["hnn_dim"]
+    fno_dim = fno_config["fno_dim"]
+    L = hnn_dim
+
     # 1. Dynamic Loader Selection 
     data_root = config.get("data_root")
     if dataset_type == "PSM":
-        train_final, test_final, test_labels, _, _ = load_psm_windows(data_root, config)
-    elif dataset_type == "SMAP":
-        train_final, test_final, test_labels, _, _ = load_smap_windows(data_root, machine_id, config)
-    elif dataset_type == "MSL":
-        train_final, test_final, test_labels, _, _ = load_msl_windows(data_root, machine_id, config)
-    else: 
-        train_final, test_final, test_labels, _, _ = load_smd_windows(data_root, machine_id, config)
+        train_final, test_final, test_labels = load_psm_windows(data_root, config)
+    else:
+        train_final, test_final, test_labels = load_smd_windows(data_root, machine_id, config)
+    
     
     topo = train_final['topology']
     phy_dim = len(topo.idx_phy)
@@ -103,42 +114,47 @@ def train_on_machine(machine_id, config):
     
     # 🚀 DYNAMIC PATIENCE SELECTION
     if phy_dim == 0:
-        # Extreme Machine (e.g., G-7): No Physics consensus
+        # Extreme Machine : No Consensus sensor
         # We need high patience to overcome the 'Val MSE: nan' trap
         current_patience = 100 
         print(f"📡 Mode: Residual-Only. Setting High Patience ({current_patience})")
     else:
-        # Healthy Machine (e.g., A-1): Has Physical consensus
+        # Healthy Machine : Has Physical consensus
         # Low patience prevents overfitting on deterministic telemetry
-        current_patience = config.get("patience", 10)
+        current_patience = global_config.get("patience", 10)
         print(f"🛰️ Mode: Dual-Anchor. Setting Standard Patience ({current_patience})")
 
-    config['patience'] = current_patience
+    global_config["patience"] = current_patience
     # 2. Build Datasets
-    from src.utils import build_tf_datasets
-    train_ds, val_ds, _ = build_tf_datasets(train_final, test_final, val_split=VS, batch_size=BS)
+    train_ds, val_ds, _ = dataloader(train_final, test_final, val_split=VS, batch_size=BS)
 
-    # 3. Build Models
-    from src.models import build_dual_encoder, build_dual_decoder, build_discriminator
-    encoder = build_dual_encoder(input_shape_sys=(W, phy_dim), input_shape_res=(W, res_dim), config=config)
-    decoder = build_dual_decoder(feat_sys=phy_dim, feat_res=res_dim, output_steps=W, config=config)
-    discriminator = build_discriminator(input_dim=L * 2)
-
-    # 4. Trainer Initialization
-    from src.trainer import DualAnchorACAETrainer
-    trainer = DualAnchorACAETrainer(encoder=encoder, decoder=decoder, discriminator=discriminator, config=config, topology=topo)
+    # 3. Trainer Initialization
+    trainer = DualAnchorACAETrainer(
+        encoder=DualEncoder,
+        decoder=DualDecoder,
+        discriminator=Discriminator,
+        hnn_config=hnn_config,
+        fno_config=fno_config,
+        global_config=global_config,
+        topology=topo
+    )
     
     # Training with Early Stopping
     trainer.fit(train_ds, val_ds=val_ds, epochs=EP)
-    
-    # Save Weights
+
+    # Save Weights (PyTorch) + load check
     save_path = f"results/weights/{dataset_type}/{machine_id}"
     os.makedirs(save_path, exist_ok=True)
-    trainer.encoder.save_weights(f"{save_path}/encoder.weights.h5")
-    trainer.decoder.save_weights(f"{save_path}/decoder.weights.h5")
+    encoder_path = os.path.join(save_path, "encoder.pt")
+    decoder_path = os.path.join(save_path, "decoder.pt")
+    torch.save(trainer.encoder.state_dict(), encoder_path)
+    torch.save(trainer.decoder.state_dict(), decoder_path)
+    trainer.encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"), strict=True)
+    trainer.decoder.load_state_dict(torch.load(decoder_path, map_location="cpu"), strict=True)
+
     # 5. Scoring & Diagnostic Normalization
-    recons = trainer.reconstruct_errors(test_final, batch_size=BS)
-    # Paper-aligned sequence length logic 
+    recons = trainer.reconstruct(test_final, batch_size=BS)
+    #  sequence length logic 
     num_windows = test_final['res'].shape[0]
     actual_len = (num_windows - 1) * stride + W
 
@@ -169,7 +185,7 @@ def train_on_machine(machine_id, config):
         windowed_labels = test_labels[:num_windows * W].reshape(-1, W)
         test_labels = aggregate_scores(windowed_labels, stride, W, actual_len, is_label=True)
 
-    # 1. Physics Branch [cite: 486, 487]
+    # 1. Physics Branch 
     if phy_dim > 0:
         se_p = recons['se_p']
         e_p = aggregate_scores(se_p, stride, W, actual_len)

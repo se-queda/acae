@@ -1,25 +1,34 @@
 import os
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 from scipy.signal import savgol_filter
 from scipy.interpolate import CubicSpline
 from sklearn.preprocessing import StandardScaler
 
 import matplotlib.pyplot as plt
 
-# Internal imports
-from .masking import get_masked_views, resi_masker
-from .router import route_features
+from src.configs.global_config import global_config
+
+
 
 
 def load_file(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"file not found {path}")
     try:
-        return np.loadtxt(path, delimiters = ',', dtype = np.float32)
-    except:
-        return np.loadtxt(path, dtype = np.float32)
+        return np.loadtxt(path, delimiter=",", dtype=np.float32)
+    except Exception:
+        try:
+            # Handle trailing delimiters or missing values in CSV-like files
+            return np.genfromtxt(
+                path,
+                delimiter=",",
+                dtype=np.float32,
+                filling_values=0.0,
+                invalid_raise=False,
+            )
+        except Exception:
+            return np.loadtxt(path, dtype=np.float32)
 
 def calculate_physics_jerk(data, savgol_len, savgol_poly):
     """Triple-gradient Jerk calculation[cite: 7, 168]."""
@@ -54,6 +63,7 @@ def create_windows(data, current_stride):
     Output:
         windows : np.ndarray (W, C, T)
     """
+    window = global_config["window_size"]
     C, T = data.shape
     num_windows = (T - window) // current_stride + 1
 

@@ -63,12 +63,10 @@ def univariate_masker(feature, jerk, tile):
 def consensus_masker(data, masked_data, cluster_labels):
     C, T = data.shape
 
-    data_np = data.values
-    masked_np = masked_data.values
 
 
-    data_windows = create_windows(data_np)       
-    masked_windows = create_windows(masked_np)   
+    data_windows = create_windows(data)       
+    masked_windows = create_windows(masked_data)   
 
     final_windows = []
     unique_clusters = np.unique(cluster_labels)
@@ -119,6 +117,8 @@ def multivariate_masker(data, jerk, cluster_labels, use_consensus_masker=True):
 
         views.append(consensus)
 
-    return tuple(views)
+    if use_consensus_masker:
+        return tuple(views)
+    return views[0]
 
 

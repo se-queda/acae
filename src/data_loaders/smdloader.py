@@ -2,7 +2,8 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.preprocessing import StandardScaler
-from global_config import global_config
+from src.configs.global_config import global_config
+import psutil, os
 
 # Assuming your internal imports are still available
 from src.router import route_features
@@ -40,14 +41,23 @@ def load_smd_windows(data_root, machine_id, config):
     test_labels = load_file(
         os.path.join(data_root, "test_label", f"{machine_id}.txt")
     ).flatten().astype(np.int32)
+    
+    print("After raw load")
+    print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1e9, "GB")
+
 
     scaler = StandardScaler()
     train_total_norm = scaler.fit_transform(train_raw) #(T, C_train)
     test_total_norm = scaler.transform(test_raw)#(T, C_train)
     train_total_norm = train_total_norm.T   # (C_train, T)
-    test_total_norm  = test_total_norm.T    # (C_train, T)       
+    test_total_norm  = test_total_norm.T    # (C_train, T)
+    train_total_norm = train_total_norm.astype(np.float64, copy=False)
+    test_total_norm  = test_total_norm.astype(np.float64, copy=False)
+      
     # Output: normalized arrays (C_train, T), (C_test, T)
 
+    print("After normalising")
+    print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1e9, "GB")
 
     # Physics routing
     # Input : normalized signals (C_train, T), (C_test, T)
@@ -61,6 +71,8 @@ def load_smd_windows(data_root, machine_id, config):
     # test_phy : (C_phy, T)
     # test_res : (C_res, T)
 
+    print("After routing")
+    print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1e9, "GB")
 
 
     # 3. Residual envelopes
@@ -109,7 +121,9 @@ def load_smd_windows(data_root, machine_id, config):
     #7. Jerk masking of isolated features
     r1 = multivariate_masker(train_res,res_jerk,res_labels,use_consensus_masker=False) #(C_train, T_res)
 
-    
+    print("After masking")
+    print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1e9, "GB")
+
     # 8. Sliding windows
     # Input : continuous signals (N_, F)
     train_w_phy = create_windows(train_phy, stride)  # (W, C_phy, T)
@@ -126,6 +140,8 @@ def load_smd_windows(data_root, machine_id, config):
     # --------------------------------------------------
     phy_views = np.stack([train_w_phy,v1, v2, v3, v4,train_phy_jerk],axis=1)
     #Stacked, (W, 6, C_phy, T)  
+    print("After windowing")
+    print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1e9, "GB")
 
 
     # --------------------------------------------------
@@ -148,8 +164,30 @@ def load_smd_windows(data_root, machine_id, config):
     # 11. Label Slicing : trunacted the last few points and its labels  that cant be in the window
     actual_test_len = (test_final["phy"].shape[0] - 1) * stride + window
     test_labels = test_labels[:actual_test_len]
-
+    print("Final")
+    print("RAM:", psutil.Process(os.getpid()).memory_info().rss / 1e9, "GB")
     return train_final, test_final, test_labels
 
 
+
+
+
+
+
+data_root = "/home/utsab/Downloads/smd/ServerMachineDataset"
+
+train_final, test_final, test_labels = load_smd_windows(
+    data_root=data_root,
+    machine_id="machine-1-1",
+    config=global_config
+)
+train_final = train_final
+print("=== TRAIN ===")
+print("phy_views:", train_final["phy_views"].shape)   # (W, 6, C_phy, T)
+print("res_views:", train_final["res_views"].shape)   # (W, C_res, T)
+
+print("\n=== TEST ===")
+print("test_phy:", test_final["phy"].shape)           # (W, C_phy, T)
+print("test_res:", test_final["res"].shape)           # (W, C_res, T)
+print("labels:", test_labels.shape)                   # (T_eff,)
 

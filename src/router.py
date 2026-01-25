@@ -29,13 +29,15 @@ class MachineTopology:
 
 def dead_sensor_finder(train_data):
     
-    variances = np.var(train_data, axis = 0)
+    # train_data: (C, T) -> variance per sensor
+    variances = np.var(train_data, axis = 1)
     idx_dead = np.where(variances < 1e-9)[0]
     return idx_dead
 
 
 def cluster_finder(data, dist_threshold):
-    corr = np.nan_to_num(np.corrcoef(data, rowvar = False))
+    # data: (C, T) -> correlate sensors (rows)
+    corr = np.nan_to_num(np.corrcoef(data, rowvar = True))
     
     dist = 1 - np.abs(corr)
     if dist.ndim == 0:
@@ -52,8 +54,8 @@ def cluster_finder(data, dist_threshold):
     
     
 def route_features(train_data, test_data, dist_threshold=0.5):
-    
-    num_total_features = train_data.shape[1]
+    # Expect (C, T) always
+    num_total_features = train_data.shape[0]
     all_indices = np.arange(num_total_features)
     
     idx_dead = dead_sensor_finder(train_data)
@@ -65,14 +67,15 @@ def route_features(train_data, test_data, dist_threshold=0.5):
         idx_lone = idx_active
         idx_res = all_indices
         phy_cluster_labels = np.array([], dtype=int)
+        res_labels = np.arange(len(idx_res), dtype=int)
         
         topo = MachineTopology(idx_phy, idx_res, idx_lone, idx_dead)
         topo.summary()
         
-        return (train_data[:, :0], train_data, test_data[:, :0], test_data), topo, phy_cluster_labels
+        return (train_data[:, :0], train_data, test_data[:, :0], test_data), topo, phy_cluster_labels, res_labels
 
 
-    train_active = train_data[:, idx_active]
+    train_active = train_data[idx_active, :]
     labels= cluster_finder(train_active, dist_threshold)
     
     
@@ -82,17 +85,17 @@ def route_features(train_data, test_data, dist_threshold=0.5):
     is_consensus = np.isin(labels, consensus_ids)
 
     phy_cluster_labels = labels[is_consensus]
-    res_labels = labels[is_consensus == False]
     idx_phy = idx_active[is_consensus]
     idx_lone = idx_active[~is_consensus]
 
     idx_res = np.sort(np.concatenate([idx_lone, idx_dead]))
+    res_labels = np.arange(len(idx_res), dtype=int)
 
     topo = MachineTopology(idx_phy, idx_res, idx_lone, idx_dead)
     topo.summary()
 
 
-    train_phy, train_res = train_data[:, idx_phy], train_data[:, idx_res]
-    test_phy, test_res = test_data[:, idx_phy], test_data[:, idx_res]
+    train_phy, train_res = train_data[idx_phy, :], train_data[idx_res, :]
+    test_phy, test_res = test_data[idx_phy, :], test_data[idx_res, :]
 
     return (train_phy, train_res, test_phy, test_res), topo, phy_cluster_labels, res_labels

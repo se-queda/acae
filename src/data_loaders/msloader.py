@@ -34,7 +34,7 @@ def load_msl_windows(data_root, machine_id, config):
     test_norm = scaler.transform(test_raw)
 
     # 2. Routing with Minimum Feature Guard
-    (train_phy, train_res, test_phy, test_res), topo, phy_labels = route_features(train_norm, test_norm)
+    (train_phy, train_res, test_phy, test_res), topo, phy_labels, _res_labels = route_features(train_norm, test_norm)
 
 
     # cluster labels required by consensus_masker — single cluster id is enough

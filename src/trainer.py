@@ -2,9 +2,9 @@
 from src.models import DualEncoder as encoder
 from src.models import DualDecoder as decoder
 from src.models import Discriminator as discriminator
-from fno_config import fno_config
-from hnn_config import hnn_config
-from global_config import global_config
+from src.configs.fno_config import fno_config
+from src.configs.hnn_config import hnn_config
+from src.configs.global_config import global_config
 
 from src.masking import mix_features
 from src.losses import discriminator_loss, encoder_loss
